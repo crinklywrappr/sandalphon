@@ -90,6 +90,24 @@ Physical device limits and sparse memory properties are currently returned as ra
 
 See [CONCEPTS.md](CONCEPTS.md) for detailed explanations of device limits and sparse resources.
 
+### Advanced VMA (Vulkan Memory Allocator) Features
+
+The basic VMA allocator is implemented and automatically created with logical devices. Advanced features for specialized use cases remain to be implemented.
+
+**Current Status:** Basic allocator with default Best-Fit algorithm implemented
+
+**Planned:**
+- **Custom Memory Pools** - Create dedicated pools with custom allocation strategies (linear allocator for free-at-once patterns, stack/LIFO, ring-buffer/FIFO)
+- **Statistics** - `vmaCalculateStatistics()` to query detailed memory usage (allocation counts, used bytes, fragmentation metrics)
+- **Budget Tracking** - `vmaGetHeapBudgets()` to monitor available memory per heap and implement memory pressure handling
+- **Defragmentation** - Incremental defragmentation API to reduce memory fragmentation without stalling
+
+**Use Cases:**
+- Custom pools: Frame-local allocations, streaming buffers, texture upload staging
+- Statistics: Debugging memory leaks, profiling allocation patterns
+- Budget tracking: Adaptive quality settings, preventing out-of-memory crashes
+- Defragmentation: Long-running applications, dynamic worlds with frequent allocation/deallocation
+
 ### Extension-Specific Device Properties
 
 Currently, `properties` only returns core `VkPhysicalDeviceProperties` fields (9 fields). Vulkan exposes ~500+ additional properties through extensions (ray tracing, mesh shaders, fragment shading rate, etc.).

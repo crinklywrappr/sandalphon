@@ -1,6 +1,8 @@
 (ns crinklywrappr.sandalphon.core
   "Low-level Vulkan bindings for Clojure, following Vulkano's design philosophy."
   (:require [clojure.set :as st]
+            [clojure.string :as sg]
+            [clojure.reflect :as reflect]
             [camel-snake-kebab.core :as csk])
   (:import [org.lwjgl.system MemoryStack]
            [org.lwjgl.vulkan VK VkApplicationInfo VkInstanceCreateInfo VkInstance
@@ -9,7 +11,9 @@
             VkQueueFamilyProperties VkDebugUtilsMessengerCallbackEXT
             VkDebugUtilsMessengerCallbackDataEXT VkDebugUtilsMessengerCreateInfoEXT
             VkDeviceCreateInfo VkDeviceQueueCreateInfo VkDevice VkDeviceGroupDeviceCreateInfo
-            VkQueue EXTDebugUtils VK10 VK11 KHRVideoDecodeQueue KHRVideoEncodeQueue NVOpticalFlow]))
+            VkQueue VkBufferCreateInfo
+            EXTDebugUtils VK10 VK11 KHRVideoDecodeQueue KHRVideoEncodeQueue NVOpticalFlow]
+           [org.lwjgl.util.vma Vma VmaAllocatorCreateInfo VmaAllocationCreateInfo VmaVulkanFunctions]))
 
 ;; ============================================================================
 ;; Error Handling
@@ -83,17 +87,24 @@
 (defn create-vulkan-version
   "Creates a VulkanVersion from a packed Vulkan version integer.
 
+  If version is nil, returns VulkanVersion for 1.0.0 (handles cases where
+  Vulkan 1.0 drivers don't report version info).
+
   Example:
     (create-vulkan-version 4211009)
     ;; => #crinklywrappr.sandalphon.core.VulkanVersion{:major 1, :minor 4, :patch 321}
 
     (str (create-vulkan-version 4211009))
-    ;; => \"1.4.321\""
+    ;; => \"1.4.321\"
+
+    (create-vulkan-version nil)
+    ;; => #crinklywrappr.sandalphon.core.VulkanVersion{:major 1, :minor 0, :patch 0}"
   [version]
-  (->VulkanVersion
-   (bit-shift-right version 22)
-   (bit-and (bit-shift-right version 12) 0x3FF)
-   (bit-and version 0xFFF)))
+  (let [v (or version VK10/VK_API_VERSION_1_0)]
+    (->VulkanVersion
+     (bit-shift-right v 22)
+     (bit-and (bit-shift-right v 12) 0x3FF)
+     (bit-and v 0xFFF))))
 
 (defn vulkan-instance-version
   "Returns the highest Vulkan instance version supported by this system.
@@ -523,6 +534,7 @@
          (for [i (range (.remaining byte-buffer))]
            (format "%02x" (bit-and 0xFF (.get byte-buffer i))))))
 
+;; TODO: limits and sparse-properties need to be improved
 (defn- query-device-properties
   "Queries all properties of a physical device."
   [^VkPhysicalDevice device ^MemoryStack stack]
@@ -606,7 +618,8 @@
                (let [vk-device-handle (VkPhysicalDevice. (.get device-pointers i) instance-handle)
                      {:keys [device-name device-type api-version]} (query-device-properties vk-device-handle stack)]
                  (with-meta (->PhysicalDevice device-name device-type api-version)
-                   {:handle vk-device-handle}))))))))))
+                   {:handle vk-device-handle
+                    :instance instance}))))))))))
 
 (defrecord PhysicalDeviceGroup [devices subset-allocation]
   PropertyQueryable
@@ -769,6 +782,10 @@
                :when feature-value] ;; true = enabled
            (csk/->kebab-case-keyword field-name)))))))
 
+;; ============================================================================
+;; Queues
+;; ============================================================================
+
 (defn- query-queue-family-properties
   "Queries queue family properties for a physical device.
   Returns a VkQueueFamilyProperties.Buffer containing all queue families."
@@ -862,20 +879,6 @@
              (with-meta (map->QueueFamily {:flags flags :max-queue-count max-queue-count})
                {:device-handle device-handle
                 :family-index i}))))))))
-
-(defrecord LogicalDevice [queues]
-  java.io.Closeable
-  (close [this]
-    (when-let [^VkDevice vk-handle (handle this)]
-      (VK10/vkDestroyDevice vk-handle nil)))
-
-  IVulkanHandle
-  (handle [this]
-    (-> this meta :handle)))
-
-;; ============================================================================
-;; Logical Device Creation - Helper Functions
-;; ============================================================================
 
 ;; queue-count is inferred from `(count priorities)`
 (defrecord QueueBuilder [queue-family priorities]
@@ -1010,6 +1013,144 @@
            {:handle vk-queue
             :queue-index queue-idx}))))))
 
+;; ============================================================================
+;; Memory Allocator
+;; ============================================================================
+
+(defrecord VulkanMemoryAllocator [flags]
+  IVulkanHandle
+  (handle [this]
+    (-> this meta :handle))
+
+  java.io.Closeable
+  (close [this]
+    (when-let [allocator-handle (handle this)]
+      (Vma/vmaDestroyAllocator allocator-handle))))
+
+(defn- flag-field? [prefix]
+  (fn inner-flag-field? [member]
+    (and (st/subset? #{:public :static :final} (:flags member))
+         (.startsWith (name (:name member)) prefix))))
+
+(def ^:private allocator-flag-map
+  "Maps allocator flag keywords to VMA_ALLOCATOR_CREATE_* bit values.
+
+  Automatically generated via reflection from the Vma class."
+  (letfn [(mapping [member]
+            (let [field-name (-> member :name name)
+                  cleaned (-> field-name
+                              (.substring 21) ; Remove "VMA_ALLOCATOR_CREATE_"
+                              (sg/replace #"_BIT$" ""))
+                  field-keyword (csk/->kebab-case-keyword cleaned)
+                  field-value (.get (.getField Vma field-name) nil)]
+              (when (and (seq cleaned) (number? field-value))
+                [field-keyword field-value])))]
+    (transduce
+     (comp (filter (flag-field? "VMA_ALLOCATOR_CREATE_"))
+           (keep mapping))
+     (completing
+      (fn f [a [k v]]
+        (assoc a k v)))
+     {} (:members (reflect/reflect Vma)))))
+
+(defn allocator-flags
+  "Returns a set of available allocator flag keywords.
+
+  The flags are automatically discovered from the VMA library via reflection.
+
+  Example:
+    (allocator-flags)
+    ;; => #{:externally-synchronized, :khr-dedicated-allocation, ...}"
+  []
+  (set (keys allocator-flag-map)))
+
+(defn- flags->int
+  "Converts a set of flag keywords to a combined integer flags value using bit-or.
+
+  Takes a flag map and a set of keywords, returning the bitwise OR of all flag values."
+  [flag-map flag-keywords]
+  (if (empty? flag-keywords)
+    0
+    (transduce
+     (map flag-map)
+     (completing bit-or)
+     0 flag-keywords)))
+
+(defn- memory-allocator!
+  "Creates a VulkanMemoryAllocator using VMA (Vulkan Memory Allocator).
+
+  This allocator uses VMA's default Best-Fit algorithm with automatic size-tier
+  optimization (small <4KB, medium 4KB-1MB, large >1MB allocations).
+
+  VMA manages device memory allocation and suballocation automatically, handling:
+  - Memory type selection based on usage requirements
+  - Alignment constraints and buffer-image granularity
+  - Fragmentation minimization
+  - Memory pool management
+
+  Arguments:
+  - device-handle - VkDevice handle (required)
+  - physical-device - PhysicalDevice record (required)
+  - stack - MemoryStack for allocations (required)
+  - flags - Set of allocator flag keywords (optional, defaults to #{})
+
+  Returns a VulkanMemoryAllocator with VMA handle in metadata.
+
+  Note on Physical Device vs Logical Device:
+  VMA requires both the logical device (VkDevice) and physical device (VkPhysicalDevice):
+  - Logical device - Used for executing memory operations (vkAllocateMemory, vkFreeMemory)
+  - Physical device - Used for querying memory capabilities (memory types, heaps, limits)
+
+  The VkDevice handle doesn't provide reverse lookup to its physical device, so VMA
+  needs both handles explicitly. For device groups, the physical device from
+  LogicalDevice represents the group's shared memory architecture (all devices in
+  a group must have compatible memory properties)."
+  [^VkDevice device-handle physical-device ^MemoryStack stack & {:keys [flags] :or {flags #{}}}]
+  (let [^VkPhysicalDevice phys-dev-handle (handle physical-device)
+        ^VkInstance instance-handle (-> physical-device meta :instance handle)
+
+        ;; Get Vulkan API version (create-vulkan-version handles nil, defaults to 1.0.0)
+        api-version (pack (:api-version physical-device))
+
+        ;; Convert flag keywords to integer
+        flags-int (flags->int allocator-flag-map flags)
+
+        ;; Setup Vulkan function pointers
+        vk-functions (doto (VmaVulkanFunctions/calloc stack)
+                       (.set instance-handle device-handle))
+
+        allocator-info (-> (VmaAllocatorCreateInfo/calloc stack)
+                           (.flags flags-int)
+                           (.physicalDevice phys-dev-handle)
+                           (.device device-handle)
+                           (.pVulkanFunctions vk-functions)
+                           (.instance instance-handle)
+                           (.vulkanApiVersion api-version))
+
+        allocator-ptr (.mallocPointer stack 1)]
+
+    (check-result (Vma/vmaCreateAllocator allocator-info allocator-ptr))
+
+    (let [vma-handle (.get allocator-ptr 0)]
+      (with-meta (->VulkanMemoryAllocator flags)
+        {:handle vma-handle}))))
+
+;; ============================================================================
+;; Logical Device Creation
+;; ============================================================================
+
+(defrecord LogicalDevice [queues physical-device allocator]
+  java.io.Closeable
+  (close [this]
+    (when allocator
+      (.close allocator))
+    (when-let [^VkDevice vk-handle (handle this)]
+      (VK10/vkDestroyDevice vk-handle nil)))
+
+  IVulkanHandle
+  (handle [this]
+    (-> this meta :handle)))
+
 (defn logical-device!
   "Creates a Vulkan logical device.
 
@@ -1039,6 +1180,9 @@
   Optional parameters:
     :enabled-extensions - Vector of Extension records to enable
     :enabled-features   - Set of feature keywords to enable (e.g., #{:geometry-shader})
+    :allocator-flags    - Set of allocator flag keywords (e.g., #{:ext-memory-budget})
+                          Call (allocator-flags) to see all available flags.
+                          Defaults to empty set (thread-safe, automatic extension detection)
 
   Returns a LogicalDevice record with the VkDevice handle stored in metadata.
 
@@ -1071,7 +1215,8 @@
              physical-device-group
              queue-requests
              enabled-extensions
-             enabled-features]}]
+             enabled-features
+             allocator-flags]}]
 
   ;; Validation
   (when-not (or physical-device physical-device-group)
@@ -1103,9 +1248,8 @@
                            :max-queue-count max-count})))))
 
     (with-open [^MemoryStack stack (MemoryStack/stackPush)]
-      (let [phys-dev-handle (if physical-device
-                              (handle physical-device)
-                              (handle (first (:devices physical-device-group))))
+      (let [physical-device' (or physical-device (first (:devices physical-device-group)))
+            phys-dev-handle (handle physical-device')
             device-group-info (create-device-group-info physical-device-group stack)
             queue-create-infos (create-queue-infos queue-requests-map stack)
             extension-names (when (seq enabled-extensions)
@@ -1124,9 +1268,308 @@
 
         (let [vk-handle (VkDevice. (.get device-ptr 0) phys-dev-handle device-info)
               queues (create-queues vk-handle queue-requests-map stack)
-              config (cond-> {:queues queues}
-                       physical-device (assoc :physical-device physical-device)
+              allocator (memory-allocator! vk-handle physical-device' stack :flags (or allocator-flags #{}))
+              config (cond-> {:queues queues
+                              :physical-device physical-device'
+                              :allocator allocator}
                        physical-device-group (assoc :physical-device-group physical-device-group)
                        (seq enabled-extensions) (assoc :enabled-extensions (vec enabled-extensions))
                        (seq enabled-features) (assoc :enabled-features (set enabled-features)))]
           (with-meta (map->LogicalDevice config) {:handle vk-handle}))))))
+
+;; ============================================================================
+;; Buffer Creation - Flags and Enums
+;; ============================================================================
+
+;; NOTE FOR MAINTAINERS: The deprecated memory usage values below are based on
+;; VMA 3.0 documentation. When updating LWJGL/VMA versions, check the VMA changelog
+;; for newly deprecated values and update this set accordingly.
+(def ^:private deprecated-memory-usages
+  "Set of deprecated VMA memory usage keywords (VMA 3.0+).
+
+  These values still work but VMA recommends using :auto, :auto-prefer-device,
+  or :auto-prefer-host instead."
+  #{:gpu-only :cpu-only :cpu-to-gpu :gpu-to-cpu :cpu-copy :gpu-lazily-allocated})
+
+(def ^:private buffer-usage-flag-map
+  "Maps buffer usage flag keywords to VK_BUFFER_USAGE_* bit values.
+
+  Automatically generated via reflection from the VK10 class."
+  (letfn [(mapping [member]
+            (let [field-name (-> member :name name)
+                  cleaned (-> field-name
+                              (.substring 16) ; Remove "VK_BUFFER_USAGE_"
+                              (sg/replace #"_BIT$" ""))
+                  field-keyword (csk/->kebab-case-keyword cleaned)
+                  field-value (.get (.getField VK10 field-name) nil)]
+              (when (and (seq cleaned) (number? field-value))
+                [field-keyword field-value])))]
+    (transduce
+     (comp (filter (flag-field? "VK_BUFFER_USAGE_"))
+        (keep mapping))
+     (completing
+      (fn f [a [k v]]
+        (assoc a k v)))
+     {} (:members (reflect/reflect VK10)))))
+
+(def ^:private allocation-flag-map
+  "Maps VMA allocation flag keywords to VMA_ALLOCATION_CREATE_* bit values.
+
+  Automatically generated via reflection from the Vma class.
+  Excludes STRATEGY_MASK which is not a usable flag."
+  (letfn [(allocation-flag-field? [member]
+            (not= (name (:name member)) "VMA_ALLOCATION_CREATE_STRATEGY_MASK"))
+          (mapping [member]
+            (let [field-name (-> member :name name)
+                  cleaned (-> field-name
+                              (.substring 22) ; Remove "VMA_ALLOCATION_CREATE_"
+                              (sg/replace #"_BIT$" ""))
+                  field-keyword (csk/->kebab-case-keyword cleaned)
+                  field-value (.get (.getField Vma field-name) nil)]
+              (when (and (seq cleaned) (number? field-value))
+                [field-keyword field-value])))]
+    (transduce
+     (comp (filter (every-pred (flag-field? "VMA_ALLOCATION_CREATE_")
+                               allocation-flag-field?))
+           (keep mapping))
+     (completing
+      (fn f [a [k v]]
+        (assoc a k v)))
+     {} (:members (reflect/reflect Vma)))))
+
+(def ^:private memory-usage-map
+  "Maps VMA memory usage keywords to VMA_MEMORY_USAGE_* enum values.
+
+  Automatically generated via reflection from the Vma class.
+
+  Use :auto, :auto-prefer-device, or :auto-prefer-host for new code."
+  (letfn [(mapping [member]
+            (let [field-name (-> member :name name)
+                  cleaned (.substring field-name 17) ; Remove "VMA_MEMORY_USAGE_"
+                  field-keyword (csk/->kebab-case-keyword cleaned)
+                  field-value (.get (.getField Vma field-name) nil)]
+              (when (and (seq cleaned) (number? field-value))
+                [field-keyword field-value])))]
+    (transduce
+     (comp (filter (flag-field? "VMA_MEMORY_USAGE_"))
+           (keep mapping))
+     (completing
+      (fn f [a [k v]]
+        (assoc a k v)))
+     {} (:members (reflect/reflect Vma)))))
+
+(defn buffer-usage-flags
+  "Returns a set of available buffer usage flag keywords.
+
+  The flags are automatically discovered from Vulkan via reflection.
+
+  Example:
+    (buffer-usage-flags)
+    ;; => #{:vertex-buffer, :index-buffer, :uniform-buffer, ...}"
+  []
+  (set (keys buffer-usage-flag-map)))
+
+(defn allocation-flags
+  "Returns a set of available VMA allocation flag keywords.
+
+  The flags are automatically discovered from VMA via reflection.
+
+  Example:
+    (allocation-flags)
+    ;; => #{:mapped, :dedicated-memory, :host-access-sequential-write, ...}"
+  []
+  (set (keys allocation-flag-map)))
+
+(defn memory-usages
+  "Returns a set of available VMA memory usage keywords.
+
+  Excludes deprecated values (VMA 3.0+).
+  Use :auto (recommended), :auto-prefer-device, or :auto-prefer-host.
+
+  Example:
+    (memory-usages)
+    ;; => #{:auto, :auto-prefer-device, :auto-prefer-host, :unknown}"
+  []
+  (transduce
+   (remove #(contains? deprecated-memory-usages %))
+   conj #{} (keys memory-usage-map)))
+
+(defn- memory-usage->int
+  "Converts a memory usage keyword to its integer value."
+  [usage-keyword]
+  (or (memory-usage-map usage-keyword)
+      (throw (ex-info "Invalid memory usage keyword"
+                      {:usage usage-keyword
+                       :valid-usages (memory-usages)}))))
+
+;; ============================================================================
+;; Buffer Creation
+;; ============================================================================
+
+(defn- validate-flag-keywords
+  "Validates that all keywords in a set exist in the given flag map.
+
+  Throws ExceptionInfo if any invalid keywords are found."
+  [flag-map flag-keywords param-name valid-fn-name]
+  (let [valid-keys (set (keys flag-map))
+        invalid-keys (remove valid-keys flag-keywords)]
+    (when (seq invalid-keys)
+      (throw (ex-info (str "Invalid " param-name " keywords")
+                      {:invalid-keywords invalid-keys
+                       :valid-keywords valid-keys
+                       :hint (str "Call (" valid-fn-name ") to see available options")})))))
+
+(defrecord Buffer [size usage memory-usage allocation-flags]
+  IVulkanHandle
+  (handle [this]
+    (-> this meta :handle))
+
+  java.io.Closeable
+  (close [this]
+    (let [buffer-handle (handle this)
+          allocator (-> this meta :allocator)
+          allocation (-> this meta :allocation)]
+      (when (and buffer-handle allocator allocation)
+        (Vma/vmaDestroyBuffer allocator buffer-handle allocation)))))
+
+(defn memory-buffer!
+  "Creates a Vulkan buffer with automatic memory allocation via VMA.
+
+  A buffer is a linear array of data stored in GPU memory. Buffers are used for
+  vertex data, indices, uniforms, storage, and data transfer operations.
+
+  The buffer must be destroyed when no longer needed. Use with-open for automatic cleanup.
+
+  Required parameters:
+    :device        - LogicalDevice that owns this buffer
+    :size          - Size of buffer in bytes (must be > 0)
+    :usage         - Set of buffer usage flags (e.g., #{:vertex-buffer :transfer-dst})
+                     Call (buffer-usage-flags) to see all available flags
+
+  Optional parameters:
+    :memory-usage      - Memory usage hint for VMA (default: :auto)
+                         Call (memory-usages) to see available options
+                         Deprecated flags are accepted but will not be shown
+    :allocation-flags  - Set of VMA allocation flags (default: #{})
+                         Call (allocation-flags) to see available flags
+    :queue-families    - Seq of QueueFamily records for concurrent access (default: [])
+                         Empty/nil = exclusive mode (single queue family)
+                         Non-empty = concurrent mode (multiple queue families can access)
+
+  Returns a Buffer record with VkBuffer and VmaAllocation handles in metadata.
+
+  Examples:
+    ;; Simple vertex buffer (exclusive mode, default)
+    (with-open [buffer (buffer! device
+                                :size 1024
+                                :usage #{:vertex-buffer})]
+      (upload-data buffer vertices))
+
+    ;; Staging buffer for transfers
+    (with-open [staging (buffer! device
+                                 :size (* 1024 1024)
+                                 :usage #{:transfer-src}
+                                 :memory-usage :auto-prefer-host
+                                 :allocation-flags #{:mapped})]
+      (copy-to-device staging data))
+
+    ;; Uniform buffer with host access
+    (with-open [uniform (buffer! device
+                                 :size 256
+                                 :usage #{:uniform-buffer}
+                                 :allocation-flags #{:mapped :host-access-sequential-write})]
+      (update-uniforms uniform camera-matrix))
+
+    ;; Concurrent buffer accessible from multiple queue families
+    (let [[graphics-family transfer-family] (queue-families physical-device)]
+      (with-open [buffer (buffer! device
+                                  :size 1024
+                                  :usage #{:vertex-buffer :transfer-dst}
+                                  :queue-families [graphics-family transfer-family])]
+        (use-from-multiple-queues buffer)))
+
+  Throws:
+    - ExceptionInfo if validation fails or buffer creation fails"
+  [device & {:keys [size usage memory-usage allocation-flags queue-families]
+             :or {memory-usage :auto
+                  allocation-flags #{}
+                  queue-families []}}]
+
+  ;; Validation
+  (when-not (pos? size)
+    (throw (ex-info "Buffer size must be positive"
+                    {:size size})))
+
+  (when (empty? usage)
+    (throw (ex-info "Buffer usage must not be empty"
+                    {:usage usage
+                     :hint "Call (buffer-usage-flags) to see available flags"})))
+
+  (validate-flag-keywords buffer-usage-flag-map usage "usage" "buffer-usage-flags")
+  (validate-flag-keywords allocation-flag-map allocation-flags "allocation-flags" "allocation-flags")
+
+  ;; Validate that queue families have queues on the device
+  (when (seq queue-families)
+    (let [device-queue-family-indices (set (map (comp index :queue-family) (:queues device)))
+          requested-indices (map index queue-families)
+          invalid-indices (remove device-queue-family-indices requested-indices)]
+      (when (seq invalid-indices)
+        (throw (ex-info "Queue families specified for buffer do not have queues on the device"
+                        {:invalid-queue-family-indices invalid-indices
+                         :device-queue-family-indices device-queue-family-indices
+                         :hint "Only specify queue families that were included in :queue-requests when creating the device"})))))
+
+  (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+    (let [allocator (:allocator device)
+          allocator-handle (handle allocator)
+
+          ;; Determine sharing mode and extract queue family indices
+          concurrent? (seq queue-families)
+          queue-indices (when concurrent?
+                          (vec (distinct (map index queue-families))))
+
+          ;; Convert keywords to integers
+          usage-flags (flags->int buffer-usage-flag-map usage)
+          alloc-flags (flags->int allocation-flag-map allocation-flags)
+          memory-usage-int (memory-usage->int memory-usage)
+          sharing-mode-int (if concurrent?
+                             VK10/VK_SHARING_MODE_CONCURRENT
+                             VK10/VK_SHARING_MODE_EXCLUSIVE)
+
+          ;; Setup queue family indices for concurrent mode
+          queue-indices-buf (when concurrent?
+                              (let [buf (.mallocInt stack (count queue-indices))]
+                                (doseq [idx queue-indices]
+                                  (.put buf (int idx)))
+                                (.flip buf)))
+
+          ;; Create buffer info
+          buffer-info (-> (VkBufferCreateInfo/calloc stack)
+                          (.sType$Default)
+                          (.size size)
+                          (.usage usage-flags)
+                          (.sharingMode sharing-mode-int))
+
+          ;; Set queue family indices if concurrent
+          _ (when queue-indices-buf
+              (.pQueueFamilyIndices buffer-info queue-indices-buf))
+
+          ;; Create allocation info
+          alloc-info (-> (VmaAllocationCreateInfo/calloc stack)
+                         (.flags alloc-flags)
+                         (.usage memory-usage-int))
+
+          ;; Output pointers
+          buffer-ptr (.mallocLong stack 1)
+          allocation-ptr (.mallocPointer stack 1)]
+
+      (check-result (Vma/vmaCreateBuffer allocator-handle buffer-info alloc-info
+                                         buffer-ptr allocation-ptr nil))
+
+      (let [buffer-handle (.get buffer-ptr 0)
+            allocation-handle (.get allocation-ptr 0)]
+        (with-meta (->Buffer size usage memory-usage allocation-flags)
+          {:handle buffer-handle
+           :allocation allocation-handle
+           :allocator allocator-handle})))))
+

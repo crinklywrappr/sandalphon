@@ -219,3 +219,170 @@
                         :physical-device-group group
                         :queue-requests [(first queue-families)])))
                   (println "  ✓ Validation rejects physical-device not in group"))))))))))
+
+(deftest step-8-memory-allocator-test
+  (testing "VulkanMemoryAllocator automatic creation with LogicalDevice"
+    (with-open [instance (vk/instance! :app-name "Sandalphon Allocator Test")]
+      (let [physical-device (first (vk/physical-devices instance))
+            queue-families (vk/queue-families physical-device)]
+
+        (testing "Allocator created automatically with device"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (let [allocator (:allocator device)]
+              (is (some? allocator) "Device should have allocator")
+              (is (instance? crinklywrappr.sandalphon.core.VulkanMemoryAllocator allocator))
+              (is (instance? java.io.Closeable allocator))
+              (is (some? (vk/handle allocator)) "Allocator should have VMA handle")
+              (is (= #{} (:flags allocator)) "Default allocator should have empty flags set")
+              (println "\n  ✓ LogicalDevice automatically creates VulkanMemoryAllocator"))))
+
+        (testing "Allocator with custom flags"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)]
+                              :allocator-flags #{:ext-memory-budget :externally-synchronized})]
+            (let [allocator (:allocator device)
+                  expected-flags #{:ext-memory-budget :externally-synchronized}]
+              (is (some? allocator) "Device should have allocator")
+              (is (= expected-flags (:flags allocator)) "Allocator should have custom flags")
+              (println "  ✓ Allocator created with custom flags"))))))))
+
+(deftest step-9-buffer-creation-test
+  (testing "Buffer creation and management"
+    (with-open [instance (vk/instance! :app-name "Sandalphon Buffer Test")]
+      (let [physical-device (first (vk/physical-devices instance))
+            queue-families (vk/queue-families physical-device)]
+
+        (testing "Basic buffer creation with minimal parameters"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (with-open [buffer (vk/memory-buffer! device
+                                           :size 1024
+                                           :usage #{:vertex-buffer})]
+              (is (instance? crinklywrappr.sandalphon.core.Buffer buffer))
+              (is (instance? java.io.Closeable buffer))
+              (is (some? (vk/handle buffer)) "Buffer should have VkBuffer handle")
+              (is (= 1024 (:size buffer)))
+              (is (= #{:vertex-buffer} (:usage buffer)))
+              (is (= :auto (:memory-usage buffer)) "Default memory usage should be :auto")
+              (is (= #{} (:allocation-flags buffer)) "Default allocation flags should be empty")
+              (println "\n  ✓ Created basic vertex buffer"))))
+
+        (testing "Buffer with multiple usage flags"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (with-open [buffer (vk/memory-buffer! device
+                                           :size 2048
+                                           :usage #{:vertex-buffer :transfer-dst :transfer-src})]
+              (is (= #{:vertex-buffer :transfer-dst :transfer-src} (:usage buffer)))
+              (println "  ✓ Created buffer with multiple usage flags"))))
+
+        (testing "Buffer with custom memory usage"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (with-open [buffer (vk/memory-buffer! device
+                                           :size 512
+                                           :usage #{:uniform-buffer}
+                                           :memory-usage :auto-prefer-host)]
+              (is (= :auto-prefer-host (:memory-usage buffer)))
+              (println "  ✓ Created buffer with custom memory usage"))))
+
+        (testing "Buffer with allocation flags"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (with-open [buffer (vk/memory-buffer! device
+                                           :size 256
+                                           :usage #{:storage-buffer}
+                                           :allocation-flags #{:mapped :dedicated-memory})]
+              (is (= #{:mapped :dedicated-memory} (:allocation-flags buffer)))
+              (println "  ✓ Created buffer with allocation flags"))))
+
+        (testing "Concurrent buffer with multiple queue families"
+          (when (>= (count queue-families) 2)
+            (with-open [device (vk/logical-device!
+                                :physical-device physical-device
+                                :queue-requests [(first queue-families) (second queue-families)])]
+              (with-open [buffer (vk/memory-buffer! device
+                                             :size 1024
+                                             :usage #{:transfer-src :transfer-dst}
+                                             :queue-families [(first queue-families) (second queue-families)])]
+                (is (some? buffer))
+                (println "  ✓ Created concurrent buffer with multiple queue families")))))
+
+        (testing "Buffer validation - zero size"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"Buffer size must be positive"
+                 (vk/memory-buffer! device :size 0 :usage #{:vertex-buffer})))
+            (println "  ✓ Validation rejects zero size")))
+
+        (testing "Buffer validation - negative size"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"Buffer size must be positive"
+                 (vk/memory-buffer! device :size -100 :usage #{:vertex-buffer})))
+            (println "  ✓ Validation rejects negative size")))
+
+        (testing "Buffer validation - empty usage"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"Buffer usage must not be empty"
+                 (vk/memory-buffer! device :size 1024 :usage #{})))
+            (println "  ✓ Validation rejects empty usage")))
+
+        (testing "Buffer validation - invalid usage flag"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"Invalid usage keywords"
+                 (vk/memory-buffer! device :size 1024 :usage #{:invalid-flag})))
+            (println "  ✓ Validation rejects invalid usage flag")))
+
+        (testing "Buffer validation - invalid allocation flag"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"Invalid allocation-flags keywords"
+                 (vk/memory-buffer! device :size 1024 :usage #{:vertex-buffer} :allocation-flags #{:bad-flag})))
+            (println "  ✓ Validation rejects invalid allocation flag")))
+
+        (testing "Buffer validation - deprecated memory usage"
+          (with-open [device (vk/logical-device!
+                              :physical-device physical-device
+                              :queue-requests [(first queue-families)])]
+            (is (thrown-with-msg?
+                 clojure.lang.ExceptionInfo
+                 #"Invalid memory usage keyword"
+                 (vk/memory-buffer! device :size 1024 :usage #{:vertex-buffer} :memory-usage :invalid)))
+            (println "  ✓ Validation rejects deprecated memory usage")))
+
+        (testing "Buffer validation - queue family without queues"
+          (when (> (count queue-families) 1)
+            (with-open [device (vk/logical-device!
+                                :physical-device physical-device
+                                :queue-requests [(first queue-families)])]
+              (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo
+                   #"Queue families specified for buffer do not have queues on the device"
+                   (vk/memory-buffer! device :size 1024 :usage #{:vertex-buffer}
+                               :queue-families [(second queue-families)])))
+              (println "  ✓ Validation rejects queue family without queues"))))))))
