@@ -2,6 +2,41 @@
   (:require [clojure.test :refer [deftest is testing]]
             [crinklywrappr.sandalphon.core :as vk]))
 
+;; Define a Vertex record for testing typed readers/writers
+(defrecord Vertex [x y z r g b])
+
+;; Helper to calculate Vertex size in bytes (6 floats)
+(def ^:private vertex-size (* 6 Float/BYTES))
+
+;; Create typed reader for Vertex
+(def read-vertex!
+  (vk/typed-reader
+    (constantly vertex-size)
+    (fn [bb]
+      (->Vertex (.getFloat bb)
+                (.getFloat bb)
+                (.getFloat bb)
+                (.getFloat bb)
+                (.getFloat bb)
+                (.getFloat bb)))))
+
+;; Implement MemoryBufferWriter for Vertex
+(extend-type Vertex
+  vk/MemoryBufferWriter
+  (write!
+    ([this buffer]
+     (vk/write! this buffer 0))
+    ([this buffer offset]
+     (let [bb (doto (java.nio.ByteBuffer/allocate vertex-size)
+                (.putFloat (:x this))
+                (.putFloat (:y this))
+                (.putFloat (:z this))
+                (.putFloat (:r this))
+                (.putFloat (:g this))
+                (.putFloat (:b this))
+                (.flip))]
+       (vk/write! bb buffer offset)))))
+
 (deftest step-1-vulkan-version-test
   (testing "Can query Vulkan instance version"
     (let [version (vk/vulkan-instance-version)]
@@ -260,9 +295,9 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [buffer (vk/memory-buffer! device
-                                           :size 1024
-                                           :usage #{:vertex-buffer})]
-              (is (instance? crinklywrappr.sandalphon.core.Buffer buffer))
+                                                  :size 1024
+                                                  :usage #{:vertex-buffer})]
+              (is (instance? crinklywrappr.sandalphon.core.MemoryBuffer buffer))
               (is (instance? java.io.Closeable buffer))
               (is (some? (vk/handle buffer)) "Buffer should have VkBuffer handle")
               (is (= 1024 (:size buffer)))
@@ -276,8 +311,8 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [buffer (vk/memory-buffer! device
-                                           :size 2048
-                                           :usage #{:vertex-buffer :transfer-dst :transfer-src})]
+                                                  :size 2048
+                                                  :usage #{:vertex-buffer :transfer-dst :transfer-src})]
               (is (= #{:vertex-buffer :transfer-dst :transfer-src} (:usage buffer)))
               (println "  ✓ Created buffer with multiple usage flags"))))
 
@@ -286,9 +321,9 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [buffer (vk/memory-buffer! device
-                                           :size 512
-                                           :usage #{:uniform-buffer}
-                                           :memory-usage :auto-prefer-host)]
+                                                  :size 512
+                                                  :usage #{:uniform-buffer}
+                                                  :memory-usage :auto-prefer-host)]
               (is (= :auto-prefer-host (:memory-usage buffer)))
               (println "  ✓ Created buffer with custom memory usage"))))
 
@@ -297,9 +332,9 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [buffer (vk/memory-buffer! device
-                                           :size 256
-                                           :usage #{:storage-buffer}
-                                           :allocation-flags #{:mapped :dedicated-memory})]
+                                                  :size 256
+                                                  :usage #{:storage-buffer}
+                                                  :allocation-flags #{:mapped :dedicated-memory})]
               (is (= #{:mapped :dedicated-memory} (:allocation-flags buffer)))
               (println "  ✓ Created buffer with allocation flags"))))
 
@@ -309,9 +344,9 @@
                                 :physical-device physical-device
                                 :queue-requests [(first queue-families) (second queue-families)])]
               (with-open [buffer (vk/memory-buffer! device
-                                             :size 1024
-                                             :usage #{:transfer-src :transfer-dst}
-                                             :queue-families [(first queue-families) (second queue-families)])]
+                                                    :size 1024
+                                                    :usage #{:transfer-src :transfer-dst}
+                                                    :queue-families [(first queue-families) (second queue-families)])]
                 (is (some? buffer))
                 (println "  ✓ Created concurrent buffer with multiple queue families")))))
 
@@ -384,5 +419,70 @@
                    clojure.lang.ExceptionInfo
                    #"Queue families specified for buffer do not have queues on the device"
                    (vk/memory-buffer! device :size 1024 :usage #{:vertex-buffer}
-                               :queue-families [(second queue-families)])))
-              (println "  ✓ Validation rejects queue family without queues"))))))))
+                                      :queue-families [(second queue-families)])))
+              (println "  ✓ Validation rejects queue family without queues")))))))
+  (testing "ByteBuffer round-trip test"
+    (with-open [instance (vk/instance!)]
+      (let [physical-device (first (vk/physical-devices instance))]
+        (with-open [device (vk/logical-device! :physical-device physical-device
+                                               :queue-requests {(first (vk/queue-families physical-device)) 1})]
+          (with-open [buffer (vk/memory-buffer! device
+                                                :size 1024
+                                                :usage #{:transfer-src}
+                                                :allocation-flags #{:host-access-sequential-write :mapped})]
+            ;; Generate random data
+            (let [random-data (byte-array 256)
+                  _ (doto (java.util.Random.)
+                      (.nextBytes random-data))
+
+                  ;; Write to buffer
+                  write-bb (doto (java.nio.ByteBuffer/wrap random-data)
+                             (.position 0))
+                  bytes-written (vk/write! write-bb buffer)]
+
+              (is (= 256 bytes-written) "Should write 256 bytes")
+
+              ;; Read back from buffer
+              (let [read-bb (java.nio.ByteBuffer/allocate 256)
+                    bytes-read (vk/read! read-bb buffer 0 256)]
+
+                (is (= 256 bytes-read) "Should read 256 bytes")
+
+                ;; Verify data matches (read! auto-flips, so ByteBuffer is ready to read)
+                (let [read-data (byte-array 256)]
+                  (.get read-bb read-data)
+                  (is (java.util.Arrays/equals random-data read-data)
+                      "Round-trip data should match original")))
+
+              (println "  ✓ ByteBuffer round-trip successful")))))))
+
+  (testing "Custom record round-trip test"
+    (with-open [instance (vk/instance!)]
+      (let [physical-device (first (vk/physical-devices instance))]
+        (with-open [device (vk/logical-device! :physical-device physical-device
+                                               :queue-requests {(first (vk/queue-families physical-device)) 1})]
+          (with-open [buffer (vk/memory-buffer! device
+                                                :size 1024
+                                                :usage #{:transfer-src}
+                                                :allocation-flags #{:host-access-sequential-write :mapped})]
+            ;; Create a vertex using Floats (explicitly cast from doubles)
+            ;; GPU shaders use 32-bit floats, not 64-bit doubles
+            (let [original-vertex (->Vertex (float 1.5) (float 2.5) (float 3.5)
+                                            (float 0.8) (float 0.6) (float 0.4))
+                  bytes-written (vk/write! original-vertex buffer)]
+
+              (is (= vertex-size bytes-written) "Should write vertex-size bytes for a vertex")
+
+              ;; Read back the vertex
+              (let [read-vertex (read-vertex! buffer)]
+
+                (is (= original-vertex read-vertex) "the structure should match")
+                (is (== (:x original-vertex) (:x read-vertex)) "X coordinate should match")
+                (is (== (:y original-vertex) (:y read-vertex)) "Y coordinate should match")
+                (is (== (:z original-vertex) (:z read-vertex)) "Z coordinate should match")
+                (is (== (:r original-vertex) (:r read-vertex)) "R color should match")
+                (is (== (:g original-vertex) (:g read-vertex)) "G color should match")
+                (is (== (:b original-vertex) (:b read-vertex)) "B color should match"))
+
+              (println "  ✓ Custom record round-trip successful"))))))))
+

@@ -4,7 +4,7 @@
             [clojure.string :as sg]
             [clojure.reflect :as reflect]
             [camel-snake-kebab.core :as csk])
-  (:import [org.lwjgl.system MemoryStack]
+  (:import [org.lwjgl.system MemoryStack MemoryUtil]
            [org.lwjgl.vulkan VK VkApplicationInfo VkInstanceCreateInfo VkInstance
             VkPhysicalDevice VkPhysicalDeviceProperties VkPhysicalDeviceFeatures
             VkLayerProperties VkExtensionProperties VkPhysicalDeviceGroupProperties
@@ -13,7 +13,9 @@
             VkDeviceCreateInfo VkDeviceQueueCreateInfo VkDevice VkDeviceGroupDeviceCreateInfo
             VkQueue VkBufferCreateInfo
             EXTDebugUtils VK10 VK11 KHRVideoDecodeQueue KHRVideoEncodeQueue NVOpticalFlow]
-           [org.lwjgl.util.vma Vma VmaAllocatorCreateInfo VmaAllocationCreateInfo VmaVulkanFunctions]))
+           [org.lwjgl.util.vma Vma VmaAllocatorCreateInfo VmaAllocationCreateInfo VmaVulkanFunctions]
+           [java.nio ByteBuffer]
+           [java.util.concurrent.atomic AtomicLong]))
 
 ;; ============================================================================
 ;; Error Handling
@@ -1306,7 +1308,7 @@
                 [field-keyword field-value])))]
     (transduce
      (comp (filter (flag-field? "VK_BUFFER_USAGE_"))
-        (keep mapping))
+           (keep mapping))
      (completing
       (fn f [a [k v]]
         (assoc a k v)))
@@ -1403,7 +1405,7 @@
                        :valid-usages (memory-usages)}))))
 
 ;; ============================================================================
-;; Buffer Creation
+;; Memory Buffer Creation
 ;; ============================================================================
 
 (defn- validate-flag-keywords
@@ -1419,7 +1421,7 @@
                        :valid-keywords valid-keys
                        :hint (str "Call (" valid-fn-name ") to see available options")})))))
 
-(defrecord Buffer [size usage memory-usage allocation-flags]
+(defrecord MemoryBuffer [size usage memory-usage allocation-flags]
   IVulkanHandle
   (handle [this]
     (-> this meta :handle))
@@ -1428,9 +1430,35 @@
   (close [this]
     (let [buffer-handle (handle this)
           allocator (-> this meta :allocator)
-          allocation (-> this meta :allocation)]
+          allocation (-> this meta :allocation)
+          ^AtomicLong mapped-ptr-atom (-> this meta :mapped-ptr-atom)]
       (when (and buffer-handle allocator allocation)
+        ;; Unmap if buffer was mapped
+        (when (and mapped-ptr-atom (not= 0 (.get mapped-ptr-atom)))
+          (Vma/vmaUnmapMemory allocator allocation)
+          (.set mapped-ptr-atom 0))
         (Vma/vmaDestroyBuffer allocator buffer-handle allocation)))))
+
+(defn host-has-access?
+  "Returns true if the buffer has host-accessible memory (HOST_VISIBLE).
+
+  Buffers with :host-access-sequential-write or :host-access-random allocation flags
+  have host-accessible memory and can be mapped for CPU access."
+  [buffer]
+  (let [allocation-flags (:allocation-flags buffer)]
+    (or (contains? allocation-flags :host-access-sequential-write)
+        (contains? allocation-flags :host-access-random))))
+
+(defn coherent?
+  "Returns true if the buffer uses coherent memory.
+
+  Coherent memory automatically synchronizes between CPU and GPU, so flush/invalidate
+  operations are not required. Non-coherent memory requires explicit flush (after CPU writes)
+  or invalidate (before CPU reads) for changes to be visible.
+
+  Buffers with :host-access-sequential-write or :host-access-random flags are coherent."
+  [buffer]
+  (host-has-access? buffer))
 
 (defn memory-buffer!
   "Creates a Vulkan buffer with automatic memory allocation via VMA.
@@ -1567,9 +1595,336 @@
                                          buffer-ptr allocation-ptr nil))
 
       (let [buffer-handle (.get buffer-ptr 0)
-            allocation-handle (.get allocation-ptr 0)]
-        (with-meta (->Buffer size usage memory-usage allocation-flags)
+            allocation-handle (.get allocation-ptr 0)
+
+            ;; Check if buffer has host access (required for mapping)
+            has-host-access? (host-has-access? {:allocation-flags allocation-flags})
+
+            ;; If :mapped flag was specified AND buffer has host access, map it now
+            mapped-ptr-atom (when (and (contains? allocation-flags :mapped) has-host-access?)
+                              (let [ptr-buf (.mallocPointer stack 1)]
+                                (check-result (Vma/vmaMapMemory allocator-handle allocation-handle ptr-buf))
+                                (AtomicLong. (long (.get ptr-buf 0)))))]
+
+        (with-meta (->MemoryBuffer size usage memory-usage allocation-flags)
           {:handle buffer-handle
            :allocation allocation-handle
-           :allocator allocator-handle})))))
+           :allocator allocator-handle
+           :mapped-ptr-atom mapped-ptr-atom})))))
 
+(defn mapped?
+  "Returns true if the buffer is currently mapped to host memory.
+
+  A mapped buffer has a CPU-accessible pointer to its GPU memory."
+  [buffer]
+  (let [^AtomicLong mapped-ptr-atom (-> buffer meta :mapped-ptr-atom)]
+    (and mapped-ptr-atom (not= 0 (.get mapped-ptr-atom)))))
+
+(defn ensure-mapped!
+  "Ensures the buffer is mapped and returns the mapped pointer address.
+
+  If the buffer is already mapped (either persistently via :mapped flag or previously
+  via ensure-mapped!), returns the existing pointer. Otherwise, maps the buffer and
+  caches the pointer for future use.
+
+  The buffer must have been created with :host-access-sequential-write or
+  :host-access-random allocation flags (HOST_VISIBLE memory).
+
+  Returns the pointer address as a long.
+
+  Throws ExceptionInfo if:
+  - Buffer does not have host access flags
+  - Mapping fails
+
+  Note: Buffers mapped via ensure-mapped! will be automatically unmapped when closed."
+  [buffer]
+  (let [^AtomicLong mapped-ptr-atom (-> buffer meta :mapped-ptr-atom)
+        current-ptr (.get mapped-ptr-atom)]
+    (if (not= 0 current-ptr)
+      ;; Already mapped
+      current-ptr
+      ;; Need to map
+      (do
+        (when-not (host-has-access? buffer)
+          (throw (ex-info "Cannot map buffer without host access flags"
+                          {:buffer buffer
+                           :hint "Create buffer with :host-access-sequential-write or :host-access-random allocation flags"})))
+        (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+          (let [allocator (-> buffer meta :allocator)
+                allocation (-> buffer meta :allocation)
+                ptr-buf (.mallocPointer stack 1)]
+            (check-result (Vma/vmaMapMemory allocator allocation ptr-buf))
+            (let [new-ptr (.get ptr-buf 0)]
+              ;; Atomically update the pointer if still zero
+              (if (.compareAndSet mapped-ptr-atom 0 new-ptr)
+                new-ptr
+                ;; Another thread mapped it first, unmap our attempt and return the winner
+                (do
+                  (Vma/vmaUnmapMemory allocator allocation)
+                  (.get mapped-ptr-atom))))))))))
+
+(defn flush-buffer!
+  "Flushes CPU writes to GPU for non-coherent memory buffers.
+
+  After writing to a buffer's mapped memory from the CPU, you must flush to make
+  the writes visible to the GPU. This is only required for non-coherent memory.
+
+  For coherent buffers (created with :host-access-sequential-write or :host-access-random),
+  this is a no-op as CPU writes are automatically visible to the GPU.
+
+  Optional parameters:
+    :offset - Byte offset to start flush (default: 0)
+    :size   - Number of bytes to flush (default: entire buffer)
+
+  Example:
+    (write! byte-buffer staging-buffer)
+    (flush-buffer! staging-buffer)  ; Make writes visible to GPU"
+  [buffer & {:keys [offset size]
+             :or {offset 0}}]
+  (when-not (coherent? buffer)
+    (let [allocator (-> buffer meta :allocator)
+          allocation (-> buffer meta :allocation)
+          flush-size (or size (:size buffer))]
+      (check-result (Vma/vmaFlushAllocation allocator allocation offset flush-size)))))
+
+(defn invalidate-buffer!
+  "Invalidates CPU cache before reading GPU writes for non-coherent memory buffers.
+
+  Before reading from a buffer's mapped memory on the CPU (after GPU has written to it),
+  you must invalidate to ensure you read the latest GPU writes. This is only required
+  for non-coherent memory.
+
+  For coherent buffers (created with :host-access-sequential-write or :host-access-random),
+  this is a no-op as GPU writes are automatically visible to the CPU.
+
+  Optional parameters:
+    :offset - Byte offset to start invalidation (default: 0)
+    :size   - Number of bytes to invalidate (default: entire buffer)
+
+  Example:
+    ;; GPU writes to buffer via compute/transfer...
+    (invalidate-buffer! readback-buffer)  ; Make GPU writes visible to CPU
+    (read! byte-buffer readback-buffer)   ; Now safe to read"
+  [buffer & {:keys [offset size]
+             :or {offset 0}}]
+  (when-not (coherent? buffer)
+    (let [allocator (-> buffer meta :allocator)
+          allocation (-> buffer meta :allocation)
+          invalidate-size (or size (:size buffer))]
+      (check-result (Vma/vmaInvalidateAllocation allocator allocation offset invalidate-size)))))
+
+(defprotocol MemoryBufferReader
+  "Protocol for reading raw bytes from Vulkan buffers.
+
+  Implementations handle the low-level details of:
+  - Ensuring the buffer is mapped
+  - Invalidating CPU cache before reads (non-coherent memory)
+  - Copying data from device to host memory
+
+  The buffer must have been created with :host-access-sequential-write or
+  :host-access-random allocation flags (HOST_VISIBLE memory)."
+
+  (read!
+    [this memory-buffer]
+    [this memory-buffer offset length]
+    "Reads data from a Vulkan buffer into this object.
+
+    2-arity: Reads from buffer offset 0, up to buffer size or available space in this object
+    4-arity: Reads `length` bytes starting at `offset`, up to available space in this object
+
+    Automatically:
+    - Maps the buffer if not already mapped (via ensure-mapped!)
+    - Invalidates CPU cache for non-coherent memory (via invalidate-buffer!)
+
+    The actual number of bytes read may be less than requested if this object has
+    insufficient space.
+
+    Parameters:
+      memory-buffer - The Buffer to read from
+      offset        - Byte offset in the buffer to start reading from (default: 0)
+      length        - Number of bytes to read (default: entire buffer size)
+
+    Returns:
+      Number of bytes actually read
+
+    Implementation notes for ByteBuffer:
+    - Reads into ByteBuffer starting at its current position
+    - Automatically flips the ByteBuffer after reading (sets position=0, limit=bytes-read)
+    - After read!, ByteBuffer is ready to be read from (no manual flip needed)
+    - Reads min(length, ByteBuffer.remaining()) bytes"))
+
+(defprotocol MemoryBufferWriter
+  "Protocol for writing raw bytes to Vulkan buffers.
+
+  Implementations handle the low-level details of:
+  - Ensuring the buffer is mapped
+  - Copying data from host to device memory
+  - Flushing CPU writes to GPU (non-coherent memory)
+
+  The buffer must have been created with :host-access-sequential-write or
+  :host-access-random allocation flags (HOST_VISIBLE memory)."
+
+  (write!
+    [this memory-buffer]
+    [this memory-buffer offset]
+    "Writes data from this object to a Vulkan buffer.
+
+    2-arity: Writes data starting at buffer offset 0
+    3-arity: Writes data starting at buffer `offset`
+
+    Automatically:
+    - Maps the buffer if not already mapped (via ensure-mapped!)
+    - Flushes CPU writes for non-coherent memory (via flush-buffer!)
+
+    Validates that the write does not exceed the buffer's size.
+
+    Parameters:
+      memory-buffer - The Buffer to write to
+      offset        - Byte offset in the buffer to start writing to (default: 0)
+
+    Returns:
+      Number of bytes actually written
+
+    Throws:
+      ExceptionInfo if write would exceed buffer size
+
+    Implementation notes for ByteBuffer:
+    - Writes from ByteBuffer's current position to limit
+    - Updates ByteBuffer's position by the number of bytes written
+    - Bytes written = ByteBuffer.remaining()"))
+
+(extend-type ByteBuffer
+  MemoryBufferReader
+
+  (read!
+    ([this memory-buffer]
+     (read! this memory-buffer 0 (:size memory-buffer)))
+
+    ([this memory-buffer offset length]
+     ;; Validate buffer has host access
+     (when-not (host-has-access? memory-buffer)
+       (throw (ex-info "Cannot read from buffer without host access"
+                       {:buffer memory-buffer
+                        :hint "Create buffer with :host-access-sequential-write or :host-access-random allocation flags"})))
+
+     ;; Invalidate before reading (no-op for coherent memory)
+     (invalidate-buffer! memory-buffer :offset offset :size length)
+
+     ;; Ensure buffer is mapped and get pointer
+     (let [mapped-ptr (ensure-mapped! memory-buffer)
+           ;; Create ByteBuffer view of mapped memory at offset
+           src-buffer (MemoryUtil/memByteBuffer (+ mapped-ptr offset) length)
+           ;; Determine how many bytes to copy (min of length and remaining space in dest)
+           bytes-to-copy (min length (.remaining this))]
+
+       ;; Copy from mapped memory to destination ByteBuffer
+       (let [original-limit (.limit src-buffer)]
+         (.limit src-buffer bytes-to-copy)
+         (.put this src-buffer)
+         (.limit src-buffer original-limit))
+
+       ;; Flip the ByteBuffer to prepare it for reading
+       (.flip this)
+
+       ;; Return number of bytes read
+       bytes-to-copy))))
+
+(extend-type ByteBuffer
+  MemoryBufferWriter
+
+  (write!
+    ([this memory-buffer]
+     (write! this memory-buffer 0))
+
+    ([this memory-buffer offset]
+     ;; Validate buffer has host access
+     (when-not (host-has-access? memory-buffer)
+       (throw (ex-info "Cannot write to buffer without host access"
+                       {:buffer memory-buffer
+                        :hint "Create buffer with :host-access-sequential-write or :host-access-random allocation flags"})))
+
+     ;; Ensure buffer is mapped and get pointer
+     (let [mapped-ptr (ensure-mapped! memory-buffer)
+           ;; Determine how many bytes to write (ByteBuffer's remaining bytes)
+           bytes-to-write (.remaining this)
+           ;; Validate write doesn't exceed buffer size
+           buffer-size (:size memory-buffer)]
+
+       (when (> (+ offset bytes-to-write) buffer-size)
+         (throw (ex-info "Write would exceed buffer size"
+                         {:buffer-size buffer-size
+                          :offset offset
+                          :bytes-to-write bytes-to-write
+                          :required-size (+ offset bytes-to-write)})))
+
+       ;; Create ByteBuffer view of mapped memory at offset
+       (let [dst-buffer (MemoryUtil/memByteBuffer (+ mapped-ptr offset) bytes-to-write)]
+         ;; Copy from source ByteBuffer to mapped memory
+         (.put dst-buffer this))
+
+       ;; Flush after writing (no-op for coherent memory)
+       (flush-buffer! memory-buffer :offset offset :size bytes-to-write)
+
+       ;; Return number of bytes written
+       bytes-to-write))))
+
+(defn typed-reader
+  "Creates a reader function for structured data types.
+
+  Takes a size function and a deserialize function, and returns a function that
+  reads structured data from a buffer.
+
+  Parameters:
+    size-fn        - A function (fn [] size-in-bytes) that returns the size of the type
+    deserialize-fn - A function (fn [ByteBuffer] value) that deserializes from a ByteBuffer
+
+  Returns:
+    A function (fn [buffer offset] value) that reads from a buffer and returns the deserialized value
+
+  The deserialize function receives a ByteBuffer that has already been read and flipped,
+  ready to read from (position=0, limit=bytes-read).
+
+  For writing structured data to buffers, implement the MemoryBufferWriter protocol
+  for your type instead. This gives you direct control over serialization.
+
+  Example:
+    (defrecord Vertex [x y z r g b])
+    ;; works on doubles if they are small enough to fit in a float.
+    (def vertex-size (* 6 Float/BYTES))
+
+    ;; Reading - use typed-reader
+    (def read-vertex!
+      (sandalphon/typed-reader
+        (constantly vertex-size)
+        (fn [bb]
+          (->Vertex (.getFloat bb) (.getFloat bb) (.getFloat bb)
+                    (.getFloat bb) (.getFloat bb) (.getFloat bb)))))
+
+    ;; Writing - implement MemoryBufferWriter protocol
+    (extend-type Vertex
+      MemoryBufferWriter
+      (write!
+        ([this buffer] (write! this buffer 0))
+        ([this buffer offset]
+         (let [bb (doto (ByteBuffer/allocate vertex-size)
+                    (.putFloat (:x this))
+                    (.putFloat (:y this))
+                    (.putFloat (:z this))
+                    (.putFloat (:r this))
+                    (.putFloat (:g this))
+                    (.putFloat (:b this))
+                    (.flip))]
+           (sandalphon/write! bb buffer offset)))))
+
+    ;; Usage:
+    (let [vertex (read-vertex! vulkan-memory-buffer 0)]
+      (println (:x vertex)))
+    (write! my-vertex vulkan-memory-buffer 0)"
+  [size-fn deserialize-fn]
+  (fn reader
+    ([buffer] (reader buffer 0))
+    ([buffer offset]
+     (let [size (size-fn)
+           bb (java.nio.ByteBuffer/allocate size)]
+       (read! bb buffer offset size)
+       (deserialize-fn bb)))))
