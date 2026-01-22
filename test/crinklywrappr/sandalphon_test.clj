@@ -1,6 +1,7 @@
 (ns crinklywrappr.sandalphon-test
   (:require [clojure.test :refer [deftest is testing]]
-            [crinklywrappr.sandalphon.core :as vk]))
+            [crinklywrappr.sandalphon.core :as vk]
+            [crinklywrappr.sandalphon.protocols :refer [handle properties index]]))
 
 ;; Define a Vertex record for testing typed readers/writers
 (defrecord Vertex [x y z r g b])
@@ -55,7 +56,7 @@
       (is (some? instance))
       (is (instance? crinklywrappr.sandalphon.core.Instance instance))
       (is (instance? java.io.Closeable instance))
-      (is (some? (vk/handle instance)) "Handle should be accessible via protocol")
+      (is (some? (handle instance)) "Handle should be accessible via protocol")
       (is (= "Sandalphon Test" (get-in instance [:config :app-name]))))))
 
 (deftest step-3-layer-properties-test
@@ -74,12 +75,12 @@
         (is (string? (:description layer)))
 
         ;; Check full properties via PropertyQueryable
-        (let [props (vk/properties layer)]
+        (let [props (properties layer)]
           (is (integer? (:implementation-version props)) "Implementation version should be raw integer"))
 
         (println (str "  - " (:layer-name layer)))
         (println (str "      Spec: " (str (:spec-version layer))
-                     ", Impl: " (str (:implementation-version (vk/properties layer)))))
+                     ", Impl: " (str (:implementation-version (properties layer)))))
         (println (str "      " (:description layer)))))))
 
 (deftest step-4-physical-devices-test
@@ -94,7 +95,7 @@
 
         (doseq [device devices]
           (is (instance? crinklywrappr.sandalphon.core.PhysicalDevice device))
-          (is (some? (vk/handle device)) "Handle should be accessible via protocol")
+          (is (some? (handle device)) "Handle should be accessible via protocol")
 
           ;; Check that all fields exist and have valid values
           (is (string? (:device-name device)))
@@ -128,7 +129,7 @@
           ;; Verify each device in the group
           (doseq [device (:devices group)]
             (is (instance? crinklywrappr.sandalphon.core.PhysicalDevice device))
-            (is (some? (vk/handle device)) "Handle should be accessible via protocol")
+            (is (some? (handle device)) "Handle should be accessible via protocol")
             (is (string? (:device-name device)))
             (is (keyword? (:device-type device)))
             (is (instance? crinklywrappr.sandalphon.core.VulkanVersion (:api-version device)))
@@ -150,7 +151,7 @@
                               :queue-requests [(first queue-families)])]
             (is (instance? crinklywrappr.sandalphon.core.LogicalDevice device))
             (is (instance? java.io.Closeable device))
-            (is (some? (vk/handle device)))
+            (is (some? (handle device)))
             (is (vector? (:queues device)))
             (is (= 1 (count (:queues device))))
             (println "  ✓ Created device with 1 queue")))
@@ -165,10 +166,10 @@
               (println (str "  ✓ Created device with 2 queues from 2 families")))))
 
         (testing "Device creation with queue-builder and custom queue count"
-          (let [family-with-multiple (first (filter #(> (:max-queue-count (vk/properties %)) 1)
+          (let [family-with-multiple (first (filter #(> (:max-queue-count (properties %)) 1)
                                                     queue-families))]
             (when family-with-multiple
-              (let [max-count (:max-queue-count (vk/properties family-with-multiple))
+              (let [max-count (:max-queue-count (properties family-with-multiple))
                     requested-count (min 2 max-count)]
                 (with-open [device (vk/logical-device!
                                     :physical-device physical-device
@@ -178,7 +179,7 @@
                   (println (str "  ✓ Created device with " requested-count " queues using queue-builder")))))))
 
         (testing "Device creation with custom priorities"
-          (let [family-with-multiple (first (filter #(> (:max-queue-count (vk/properties %)) 1)
+          (let [family-with-multiple (first (filter #(> (:max-queue-count (properties %)) 1)
                                                     queue-families))]
             (when family-with-multiple
               (with-open [device (vk/logical-device!
@@ -204,8 +205,8 @@
             (let [queue (first (:queues device))]
               (is (instance? crinklywrappr.sandalphon.core.Queue queue))
               (is (instance? crinklywrappr.sandalphon.core.QueueFamily (:queue-family queue)))
-              (is (some? (vk/handle queue)) "Queue should have VkQueue handle")
-              (is (number? (vk/index queue)) "Queue should have queue index")
+              (is (some? (handle queue)) "Queue should have VkQueue handle")
+              (is (number? (index queue)) "Queue should have queue index")
               (println "  ✓ Queue records are valid"))))))))
 
 (deftest step-7-logical-device-validation-test
@@ -230,7 +231,7 @@
 
         (testing "Exceeding max-queue-count"
           (let [first-family (first queue-families)
-                max-count (:max-queue-count (vk/properties first-family))]
+                max-count (:max-queue-count (properties first-family))]
             (is (thrown-with-msg?
                  clojure.lang.ExceptionInfo
                  #"Requested queue-count exceeds max-queue-count"
@@ -269,7 +270,7 @@
               (is (some? allocator) "Device should have allocator")
               (is (instance? crinklywrappr.sandalphon.core.VulkanMemoryAllocator allocator))
               (is (instance? java.io.Closeable allocator))
-              (is (some? (vk/handle allocator)) "Allocator should have VMA handle")
+              (is (some? (handle allocator)) "Allocator should have VMA handle")
               (is (= #{} (:flags allocator)) "Default allocator should have empty flags set")
               (println "\n  ✓ LogicalDevice automatically creates VulkanMemoryAllocator"))))
 
@@ -299,7 +300,7 @@
                                                   :usage #{:vertex-buffer})]
               (is (instance? crinklywrappr.sandalphon.core.MemoryBuffer buffer))
               (is (instance? java.io.Closeable buffer))
-              (is (some? (vk/handle buffer)) "Buffer should have VkBuffer handle")
+              (is (some? (handle buffer)) "Buffer should have VkBuffer handle")
               (is (= 1024 (:size buffer)))
               (is (= #{:vertex-buffer} (:usage buffer)))
               (is (= :auto (:memory-usage buffer)) "Default memory usage should be :auto")
@@ -486,3 +487,103 @@
 
               (println "  ✓ Custom record round-trip successful"))))))))
 
+(deftest step-10-command-pool-test
+  (testing "Can create and destroy command pool"
+    (with-open [instance (vk/instance!)]
+      (let [physical-devices (vk/physical-devices instance)]
+        (when (seq physical-devices)
+          (let [physical-device (first physical-devices)
+                queue-families (vk/queue-families physical-device)]
+            (when (seq queue-families)
+              (with-open [device (vk/logical-device!
+                                  :physical-device physical-device
+                                  :queue-requests [(first queue-families)])]
+                (testing "Create command pool with default flags"
+                  (with-open [pool (vk/command-pool! device (first queue-families))]
+                    (is (instance? crinklywrappr.sandalphon.core.CommandPool pool))
+                    (is (some? (handle pool)) "Pool should have a handle")
+                    (is (= (first queue-families) (:queue-family pool)))
+                    (is (= #{:reset-command-buffer} (:flags pool)))
+                    (println "  ✓ Command pool created with default flags")))
+
+                (testing "Create command pool with custom flags"
+                  (with-open [pool (vk/command-pool! device (first queue-families)
+                                                     :flags #{:transient})]
+                    (is (instance? crinklywrappr.sandalphon.core.CommandPool pool))
+                    (is (some? (handle pool)))
+                    (is (= #{:transient} (:flags pool)))
+                    (println "  ✓ Command pool created with :transient flag")))
+
+                (testing "Validate available command pool flags"
+                  (let [flags (vk/command-pool-create-flags)]
+                    (is (set? flags))
+                    (is (contains? flags :reset-command-buffer))
+                    (is (contains? flags :transient))
+                    (println (str "  ✓ Available command pool flags: " flags))))
+
+                (testing "Validation rejects queue family not on device"
+                  (when (> (count queue-families) 1)
+                    ;; Create device with only first queue family
+                    (with-open [device-one-queue (vk/logical-device!
+                                                  :physical-device physical-device
+                                                  :queue-requests [(first queue-families)])]
+                      ;; Try to create pool with second queue family (not on device)
+                      (is (thrown-with-msg?
+                           clojure.lang.ExceptionInfo
+                           #"Queue family does not have queues on the device"
+                           (vk/command-pool! device-one-queue (second queue-families))))
+                      (println "  ✓ Validation rejects queue family not on device"))))))))))))
+
+(deftest step-11-command-buffer-test
+  (testing "Can allocate and free command buffers"
+    (with-open [instance (vk/instance!)]
+      (let [physical-devices (vk/physical-devices instance)]
+        (when (seq physical-devices)
+          (let [physical-device (first physical-devices)
+                queue-families (vk/queue-families physical-device)]
+            (when (seq queue-families)
+              (with-open [device (vk/logical-device!
+                                  :physical-device physical-device
+                                  :queue-requests [(first queue-families)])]
+                (with-open [pool (vk/command-pool! device (first queue-families))]
+
+                  (testing "Allocate single primary command buffer"
+                    (with-open [cmd-buf (vk/command-buffer! pool)]
+                      (is (instance? crinklywrappr.sandalphon.core.CommandBuffer cmd-buf))
+                      (is (some? (handle cmd-buf)) "Command buffer should have a handle")
+                      (is (= :primary (:level cmd-buf)))
+                      (is (= pool (:command-pool cmd-buf)))
+                      (println "  ✓ Allocated single primary command buffer")))
+
+                  (testing "Allocate multiple primary command buffers"
+                    (let [cmd-bufs (vk/command-buffer! pool 3)]
+                      (is (vector? cmd-bufs))
+                      (is (= 3 (count cmd-bufs)))
+                      (doseq [buf cmd-bufs]
+                        (is (instance? crinklywrappr.sandalphon.core.CommandBuffer buf))
+                        (is (some? (handle buf)))
+                        (is (= :primary (:level buf))))
+                      ;; Free them
+                      (doseq [buf cmd-bufs]
+                        (.close buf))
+                      (println "  ✓ Allocated and freed 3 primary command buffers")))
+
+                  (testing "Allocate secondary command buffers"
+                    (let [cmd-bufs (vk/command-buffer! pool 2 :level :secondary)]
+                      (is (vector? cmd-bufs))
+                      (is (= 2 (count cmd-bufs)))
+                      (doseq [buf cmd-bufs]
+                        (is (instance? crinklywrappr.sandalphon.core.CommandBuffer buf))
+                        (is (some? (handle buf)))
+                        (is (= :secondary (:level buf))))
+                      ;; Free them
+                      (doseq [buf cmd-bufs]
+                        (.close buf))
+                      (println "  ✓ Allocated and freed 2 secondary command buffers")))
+
+                  (testing "Validation rejects invalid level"
+                    (is (thrown-with-msg?
+                         clojure.lang.ExceptionInfo
+                         #"Invalid command buffer level"
+                         (vk/command-buffer! pool 1 :level :invalid)))
+                    (println "  ✓ Validation rejects invalid level")))))))))))

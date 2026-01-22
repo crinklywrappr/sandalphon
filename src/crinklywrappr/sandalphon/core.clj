@@ -3,7 +3,9 @@
   (:require [clojure.set :as st]
             [clojure.string :as sg]
             [clojure.reflect :as reflect]
-            [camel-snake-kebab.core :as csk])
+            [camel-snake-kebab.core :as csk]
+            [crinklywrappr.sandalphon.protocols :refer [IVulkanHandle PropertyQueryable Indexable
+                                                        handle properties index]])
   (:import [org.lwjgl.system MemoryStack MemoryUtil]
            [org.lwjgl.vulkan VK VkApplicationInfo VkInstanceCreateInfo VkInstance
             VkPhysicalDevice VkPhysicalDeviceProperties VkPhysicalDeviceFeatures
@@ -11,9 +13,12 @@
             VkQueueFamilyProperties VkDebugUtilsMessengerCallbackEXT
             VkDebugUtilsMessengerCallbackDataEXT VkDebugUtilsMessengerCreateInfoEXT
             VkDeviceCreateInfo VkDeviceQueueCreateInfo VkDevice VkDeviceGroupDeviceCreateInfo
-            VkQueue VkBufferCreateInfo
+            VkQueue VkBufferCreateInfo VkCommandPoolCreateInfo VkCommandBufferAllocateInfo
+            VkCommandBufferBeginInfo VkSubmitInfo VkSemaphoreCreateInfo VkFenceCreateInfo
             EXTDebugUtils VK10 VK11 KHRVideoDecodeQueue KHRVideoEncodeQueue NVOpticalFlow]
            [org.lwjgl.util.vma Vma VmaAllocatorCreateInfo VmaAllocationCreateInfo VmaVulkanFunctions]
+           [org.apache.commons.pool2 KeyedPooledObjectFactory]
+           [org.apache.commons.pool2.impl DefaultPooledObject GenericKeyedObjectPool]
            [java.nio ByteBuffer]
            [java.util.concurrent.atomic AtomicLong]))
 
@@ -47,20 +52,6 @@
   (when-not (= result VK10/VK_SUCCESS)
     (throw (ex-info (error-message result) {:result result})))
   result)
-
-;; ============================================================================
-;; Protocols
-;; ============================================================================
-
-(defprotocol IVulkanHandle
-  "Protocol for Vulkan objects that wrap native handles in metadata."
-  (handle [this] "Returns the native Vulkan handle stored in metadata."))
-
-(defprotocol PropertyQueryable
-  (properties [this] "returns the properties of a vulkan object"))
-
-(defprotocol Indexable
-  (index [this] "returns the index of the object in the enumerated collection from which it was derived"))
 
 ;; ============================================================================
 ;; Version Information - Step 1
@@ -1928,3 +1919,733 @@
            bb (java.nio.ByteBuffer/allocate size)]
        (read! bb buffer offset size)
        (deserialize-fn bb)))))
+
+;; ============================================================================
+;; Command Buffers
+;; ============================================================================
+
+(def ^:private command-pool-create-flag-map
+  "Maps command pool create flag keywords to VK_COMMAND_POOL_CREATE_* bit values.
+
+  Automatically generated via reflection from the VK10 class."
+  (letfn [(mapping [member]
+            (let [field-name (-> member :name name)
+                  cleaned (-> field-name
+                              (.substring 23) ; Remove "VK_COMMAND_POOL_CREATE"
+                              (sg/replace #"_BIT$" ""))
+                  field-keyword (csk/->kebab-case-keyword cleaned)
+                  field-value (.get (.getField VK10 field-name) nil)]
+              (when (and (seq cleaned) (number? field-value))
+                [field-keyword field-value])))]
+    (transduce
+     (comp (filter (flag-field? "VK_COMMAND_POOL_CREATE_"))
+           (keep mapping))
+     (completing
+      (fn f [a [k v]]
+        (assoc a k v)))
+     {} (:members (reflect/reflect VK10)))))
+
+(defn command-pool-create-flags
+  "Returns a set of available command pool create flag keywords.
+
+  The flags are automatically discovered from Vulkan via reflection.
+
+  Example:
+    (command-pool-create-flags)
+    ;; => #{:transient :reset-command-buffer :protected}"
+  []
+  (set (keys command-pool-create-flag-map)))
+
+(defrecord CommandPool [queue-family flags]
+  java.io.Closeable
+  (close [this]
+    (let [device (-> this meta :device)
+          pool-handle (handle this)]
+      (VK10/vkDestroyCommandPool (handle device) pool-handle nil)))
+
+  IVulkanHandle
+  (handle [this]
+    (-> this meta :handle)))
+
+(defn command-pool!
+  "Creates a Vulkan command pool for allocating command buffers.
+
+  A command pool manages the memory used to record command buffers. Command buffers
+  must be allocated from a pool, and each pool is associated with a specific queue
+  family.
+
+  The command pool must be destroyed when no longer needed. Use with-open for
+  automatic cleanup.
+
+  Parameters:
+    device        - LogicalDevice that owns this pool (required)
+    queue-family  - QueueFamily that command buffers from this pool will be submitted to (required)
+
+  Optional keyword parameters:
+    :flags - Set of command pool create flag keywords (default: #{:reset-command-buffer})
+             Call (command-pool-create-flags) to see available flags
+
+             Common flags:
+             :reset-command-buffer - Allow command buffers to be reset individually
+             :transient            - Hint that command buffers are short-lived
+             :protected            - Command buffers from this pool are protected
+
+  Returns a CommandPool record with VkCommandPool handle in metadata.
+
+  Examples:
+    ;; Simple pool with reset capability (default)
+    (with-open [pool (command-pool! device graphics-family)]
+      (allocate-command-buffers pool))
+
+    ;; Transient pool for short-lived command buffers
+    (with-open [pool (command-pool! device transfer-family
+                                    :flags #{:transient})]
+      (record-transfer-commands pool))
+
+  Throws:
+    - ExceptionInfo if validation fails or pool creation fails"
+  [device queue-family & {:keys [flags]
+                          :or {flags #{:reset-command-buffer}}}]
+
+  ;; Validation
+  (validate-flag-keywords command-pool-create-flag-map flags "flags" "command-pool-create-flags")
+
+  ;; Validate that queue-family has queues on the device
+  (let [device-queue-family-indices (set (map (comp index :queue-family) (:queues device)))
+        queue-family-index (index queue-family)]
+    (when-not (contains? device-queue-family-indices queue-family-index)
+      (throw (ex-info "Queue family does not have queues on the device"
+                      {:queue-family-index queue-family-index
+                       :device-queue-family-indices device-queue-family-indices
+                       :hint "Only use queue families that were included in :queue-requests when creating the device"}))))
+
+  (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+    (let [device-handle (handle device)
+          queue-family-index (index queue-family)
+          flags-int (flags->int command-pool-create-flag-map flags)
+
+          ;; Create pool info
+          pool-info (-> (VkCommandPoolCreateInfo/calloc stack)
+                        (.sType$Default)
+                        (.queueFamilyIndex queue-family-index)
+                        (.flags flags-int))
+
+          ;; Output pointer
+          pool-ptr (.mallocLong stack 1)]
+
+      (check-result (VK10/vkCreateCommandPool device-handle pool-info nil pool-ptr))
+
+      (let [pool-handle (.get pool-ptr 0)]
+        (with-meta (->CommandPool queue-family flags)
+          {:handle pool-handle
+           :device device})))))
+
+(defrecord CommandBuffer [command-pool level commands]
+  java.io.Closeable
+  (close [this]
+    (let [device (-> command-pool meta :device)
+          pool-handle (handle command-pool)
+          cmd-buffer-handle (handle this)]
+      (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+        (let [buffer-ptr (doto (.mallocPointer stack 1) (.put 0 cmd-buffer-handle) (.flip))]
+          (VK10/vkFreeCommandBuffers (handle device) pool-handle buffer-ptr)))))
+
+  IVulkanHandle
+  (handle [this]
+    (-> this meta :handle)))
+
+(defn- level->int
+  "Converts command buffer level keyword to Vulkan constant."
+  [level]
+  (case level
+    :primary VK10/VK_COMMAND_BUFFER_LEVEL_PRIMARY
+    :secondary VK10/VK_COMMAND_BUFFER_LEVEL_SECONDARY
+    (throw (ex-info "Invalid command buffer level"
+                    {:level level
+                     :valid-levels #{:primary :secondary}}))))
+
+(defn command-buffer!
+  "Allocates command buffer(s) from a command pool.
+
+  Command buffers are used to record commands that will be submitted to a queue
+  for execution on the GPU. They must be allocated from a command pool.
+
+  Arities:
+    (command-buffer! pool)             - Allocates 1 primary command buffer
+    (command-buffer! pool n)           - Allocates n command buffers (default: primary)
+    (command-buffer! pool n :level x)  - Allocates n command buffers with specified level
+
+  Parameters:
+    command-pool - CommandPool to allocate from (required)
+    n            - Number of command buffers to allocate (default: 1)
+
+  Optional keyword parameters:
+    :level - Command buffer level, :primary or :secondary (default: :primary)
+             Primary: Can be submitted to queues, cannot be called from other buffers
+             Secondary: Cannot be submitted directly, can be executed from primary buffers
+
+  Returns:
+    - Single arity: Returns one CommandBuffer
+    - Multi arity: Returns vector of CommandBuffer records
+
+  Command buffers can be freed individually with .close or automatically when the
+  pool is destroyed.
+
+  Examples:
+    ;; Allocate one primary command buffer
+    (with-open [cmd-buf (command-buffer! pool)]
+      (record-commands cmd-buf))
+
+    ;; Allocate 3 primary command buffers
+    (let [cmd-bufs (command-buffer! pool 3)]
+      (doseq [buf cmd-bufs]
+        (record-commands buf)))
+
+    ;; Allocate secondary command buffers
+    (let [secondary-bufs (command-buffer! pool 2 :level :secondary)]
+      (record-secondary-commands secondary-bufs))
+
+  Throws:
+    - ExceptionInfo if allocation fails"
+  ([command-pool]
+   (first (command-buffer! command-pool 1)))
+
+  ([command-pool n & {:keys [level]
+                      :or {level :primary}}]
+   (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+     (let [device (-> command-pool meta :device)
+           device-handle (handle device)
+           pool-handle (handle command-pool)
+           level-int (level->int level)
+
+           ;; Create allocation info
+           alloc-info (-> (VkCommandBufferAllocateInfo/calloc stack)
+                          (.sType$Default)
+                          (.commandPool pool-handle)
+                          (.level level-int)
+                          (.commandBufferCount n))
+
+           ;; Output pointers
+           cmd-buffer-ptrs (.mallocPointer stack n)]
+
+       (check-result (VK10/vkAllocateCommandBuffers device-handle alloc-info cmd-buffer-ptrs))
+
+       ;; Convert to CommandBuffer records
+       (vec
+        (for [i (range n)]
+          (let [cmd-buffer-handle (.get cmd-buffer-ptrs i)]
+            (with-meta (->CommandBuffer command-pool level [])
+              {:handle cmd-buffer-handle}))))))))
+
+;; ============================================================================
+;; Command Buffer Factory (Apache Commons Pool Integration)
+;; ============================================================================
+
+(def ^:private vk-cmd-pools (atom {}))
+
+(def ^:private pre-allocated-buffers (atom {}))
+
+(defn command-buffer-factory!
+  "Creates a KeyedPooledObjectFactory for managing command buffers with pooling.
+
+  INTERNAL API - Not intended for direct use. Use the command buffer allocator instead.
+
+  This factory implements Apache Commons Pool's KeyedPooledObjectFactory interface
+  to enable pooling and reuse of command buffers. Command buffers are keyed by:
+    :thread-id    - Thread ID (e.g., from (.getId (Thread/currentThread)))
+    :queue-family - QueueFamily to create pool/buffer for
+    :pool-flags   - Command pool flags (default: #{:reset-command-buffer})
+    :buffer-level - Command buffer level :primary or :secondary (default: :primary)
+
+  The factory maintains an internal cache of command pools (one per thread+queue-family
+  combination) and allocates command buffers from those pools. It will use pre-allocated
+  buffers if available, otherwise it creates new ones on-demand.
+
+  Returns:
+    KeyedPooledObjectFactory instance for use with GenericKeyedObjectPool"
+  []
+  (reify
+    KeyedPooledObjectFactory
+    (makeObject [_ {:keys [buffer-level] :as k}]
+      ;; Try to use a pre-allocated buffer first
+      (if-let [buf (first (get @pre-allocated-buffers k))]
+        (do
+          ;; Remove the buffer from the pre-allocated pool
+          (swap! pre-allocated-buffers update k rest)
+          (DefaultPooledObject. buf))
+        ;; Fallback: create new buffer from command pool
+        (-> (get @vk-cmd-pools k)
+            (command-buffer! 1 :level buffer-level)
+            first
+            DefaultPooledObject.)))
+    (destroyObject [_ _ pooled-obj]
+      (.close (.getObject pooled-obj)))
+    (validateObject [_ _ pooled-obj]
+      (let [cmd-buffer (.getObject pooled-obj)]
+        (boolean (handle cmd-buffer))))
+    (activateObject [_ _ _] nil)
+    (passivateObject [_ _ _] nil)))
+
+(defn command-buffer-pool!
+  "Creates a GenericKeyedObjectPool for pooling and reusing command buffers.
+
+  INTERNAL API - Not intended for direct use. Use the command buffer allocator instead.
+
+  This function wraps Apache Commons Pool's GenericKeyedObjectPool with a command
+  buffer factory. The pool manages command buffer lifecycle, including allocation,
+  validation, and cleanup.
+
+  Arities:
+    (command-buffer-pool!)
+      Creates a pool with default configuration.
+
+    (command-buffer-pool! config)
+      Creates a pool with custom GenericKeyedObjectPoolConfig.
+      Common config options:
+        - maxTotalPerKey: Max command buffers per thread+queue-family (default: 8)
+        - maxIdlePerKey: Max idle buffers kept cached per key (default: 8)
+        - minIdlePerKey: Min idle buffers maintained per key (default: 0)
+        - testOnBorrow: Validate buffers when borrowed (default: false)
+        - testOnReturn: Validate buffers when returned (default: false)
+
+    (command-buffer-pool! config abandoned-config)
+      Creates a pool with custom configuration and abandoned object tracking.
+      Use AbandonedConfig to detect and clean up leaked command buffers.
+
+  Returns:
+    GenericKeyedObjectPool instance
+
+  Example:
+    (let [config (doto (GenericKeyedObjectPoolConfig.)
+                   (.setMaxTotalPerKey 16)
+                   (.setMaxIdlePerKey 8))
+          pool (command-buffer-pool! config)]
+      ;; pool is used internally by command buffer allocator
+      ...)
+
+  See also:
+    - Apache Commons Pool documentation
+    - GenericKeyedObjectPoolConfig for configuration options
+    - AbandonedConfig for leak detection"
+  ([] (GenericKeyedObjectPool. (command-buffer-factory!)))
+  ([config] (GenericKeyedObjectPool. (command-buffer-factory!) config))
+  ([config abandoned-config] (GenericKeyedObjectPool. (command-buffer-factory!) config abandoned-config)))
+
+(defrecord CommandBufferAllocator [logical-device command-buffer-pool
+                                   primary-buffer-count secondary-buffer-count])
+
+(defn command-buffer-allocator!
+  "Creates a command buffer allocator for managing pooled command buffers.
+
+  The allocator provides a high-level interface for acquiring and managing command
+  buffers with automatic pooling, per-thread command pool management, and optional
+  pre-allocation for performance.
+
+  Parameters:
+    logical-device - LogicalDevice to create command buffers from
+
+  Optional keyword parameters:
+    :primary-buffer-count   - Number of primary buffers to pre-allocate (default: 32)
+    :secondary-buffer-count - Number of secondary buffers to pre-allocate (default: 0)
+    :config                 - GenericKeyedObjectPoolConfig for custom pool configuration
+    :abandoned-config       - AbandonedConfig for leak detection
+
+  Returns:
+    CommandBufferAllocator instance
+
+  Example:
+    (let [allocator (command-buffer-allocator! device
+                      :primary-buffer-count 64
+                      :secondary-buffer-count 16)]
+      ;; Use with acquire-command-builder to get builders
+      ...)
+
+  See also:
+    - acquire-command-builder for borrowing command buffers from the allocator"
+  [logical-device & {:keys [primary-buffer-count secondary-buffer-count config abandoned-config]
+                     :or {primary-buffer-count 32 secondary-buffer-count 0}}]
+  (let [pool (if abandoned-config
+               (command-buffer-pool! config abandoned-config)
+               (if config
+                 (command-buffer-pool! config)
+                 (command-buffer-pool!)))]
+    (->CommandBufferAllocator logical-device pool primary-buffer-count secondary-buffer-count)))
+
+(defrecord CommandBufferBuilder [commands-to-record])
+
+(defn acquire-command-builder
+  "Acquires a command buffer builder from the allocator for recording commands.
+
+  This function borrows a command buffer from the underlying pool and wraps it in
+  a builder interface. The builder allows you to queue commands that will be recorded
+  when you call the recording function.
+
+  The command buffer is automatically associated with the current thread and the
+  specified queue family, ensuring thread-safe command pool usage.
+
+  Parameters:
+    command-buffer-allocator - CommandBufferAllocator to borrow from
+    queue-family            - QueueFamily this command buffer will be submitted to
+
+  Optional keyword parameters:
+    :pool-flags   - Command pool creation flags (default: #{:reset-command-buffer})
+    :buffer-level - Command buffer level :primary or :secondary (default: :primary)
+
+  Returns:
+    CommandBufferBuilder with the borrowed command buffer in metadata
+
+  Example:
+    (let [builder (acquire-command-builder allocator graphics-family
+                    :buffer-level :primary)]
+      ;; Queue commands on the builder
+      ;; ...
+      ;; Return builder to pool when done
+      )
+
+  Important:
+    The borrowed command buffer MUST be returned to the pool after use, either by
+    calling a return/release function or through automatic cleanup. Failure to
+    return buffers will leak resources.
+
+  See also:
+    - command-buffer-allocator! for creating allocators"
+  [cmd-buffer-allocator queue-family
+   & {:keys [pool-flags buffer-level]
+      :or {buffer-level :primary pool-flags #{:reset-command-buffer}}}]
+  (let [thread-id (.getId (Thread/currentThread))
+        logical-device (:logical-device cmd-buffer-allocator)
+        cmd-buffer-pool (:command-buffer-pool cmd-buffer-allocator)
+        k {:thread-id thread-id
+           :queue-family queue-family
+           :pool-flags pool-flags
+           :buffer-level buffer-level}]
+    (if (some (partial = k) (.getKeys cmd-buffer-pool))
+      ;; Pool for this key already exists, borrow from it
+      (with-meta (->CommandBufferBuilder [])
+        {:pooled-buffer (.borrowObject cmd-buffer-pool k)})
+      ;; First time for this key: create pool and pre-allocate buffers
+      (let [cmd-pool (command-pool! logical-device queue-family :flags pool-flags)
+            buffer-count (if (= buffer-level :secondary)
+                           (:secondary-buffer-count cmd-buffer-allocator)
+                           (:primary-buffer-count cmd-buffer-allocator))
+            cmd-buffers (command-buffer! cmd-pool buffer-count :level buffer-level)]
+        ;; Store the command pool
+        (swap! vk-cmd-pools assoc k cmd-pool)
+        ;; Store the pre-allocated buffers
+        (swap! pre-allocated-buffers assoc k cmd-buffers)
+        ;; Add objects to the pool (will consume pre-allocated buffers)
+        (.addObjects cmd-buffer-pool k buffer-count)
+        ;; Borrow one for the caller
+        (with-meta (->CommandBufferBuilder [])
+          {:pooled-buffer (.borrowObject cmd-buffer-pool k)})))))
+
+;; ============================================================================
+;; Command Buffer Recording
+;; ============================================================================
+
+(def ^:private command-buffer-usage-flag-map
+  "Maps command buffer usage flag keywords to VK_COMMAND_BUFFER_USAGE_* bit values."
+  (letfn [(mapping [member]
+            (let [field-name (-> member :name name)
+                  cleaned (-> field-name
+                              (.substring 24) ; Remove "VK_COMMAND_BUFFER_USAGE_"
+                              (sg/replace #"_BIT$" ""))
+                  field-keyword (csk/->kebab-case-keyword cleaned)
+                  field-value (.get (.getField VK10 field-name) nil)]
+              (when (and (seq cleaned) (number? field-value))
+                [field-keyword field-value])))]
+    (transduce
+     (comp (filter (flag-field? "VK_COMMAND_BUFFER_USAGE_"))
+           (keep mapping))
+     (completing (fn f [a [k v]] (assoc a k v)))
+     {} (:members (reflect/reflect VK10)))))
+
+(defn command-buffer-usage-flags
+  "Returns a set of available command buffer usage flag keywords.
+
+  The flags are automatically discovered from Vulkan via reflection.
+
+  Example:
+    (command-buffer-usage-flags)
+    ;; => #{:render-pass-continue :simultaneous-use :one-time-submit}"
+  []
+  (set (keys command-buffer-usage-flag-map)))
+
+(defn build!
+  "Records all queued commands to the command buffer and returns it.
+
+  This function begins command buffer recording, executes all queued command
+  functions, and ends recording. The resulting command buffer is ready to be
+  submitted to a queue.
+
+  Parameters:
+    builder - CommandBufferBuilder with queued commands
+
+  Optional keyword parameters:
+    :usage - Set of command buffer usage flags (default: #{})
+             Available flags:
+             :one-time-submit       - Buffer will be reset after one submit
+             :render-pass-continue  - Secondary buffer entirely in render pass
+             :simultaneous-use      - Can be submitted multiple times while pending
+
+  Returns:
+    The underlying CommandBuffer, ready to submit
+
+  Example:
+    (-> builder
+        (copy-buffer! src dst)
+        (fill-buffer! dst 0)
+        (build! :usage #{:one-time-submit}))
+
+  Important:
+    After build!, the command buffer is in the executable state. It should be
+    submitted to a queue or returned to the pool. Do not call build! multiple
+    times on the same builder."
+  [builder & {:keys [usage]
+              :or {usage #{}}}]
+
+  ;; Validate usage flags
+  (validate-flag-keywords command-buffer-usage-flag-map usage "usage" "command-buffer-usage-flags")
+
+  (let [pooled-buffer (-> builder meta :pooled-buffer)
+        cmd-buffer (.getObject pooled-buffer)
+        cmd-buffer-handle (handle cmd-buffer)
+        commands (:commands-to-record builder)
+        usage-flags (flags->int command-buffer-usage-flag-map usage)]
+
+    (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+      ;; Begin command buffer recording
+      (let [begin-info (-> (VkCommandBufferBeginInfo/calloc stack)
+                           (.sType$Default)
+                           (.flags usage-flags)
+                           (.pInheritanceInfo nil))]
+        (check-result (VK10/vkBeginCommandBuffer cmd-buffer-handle begin-info)))
+
+      ;; Execute all queued commands
+      (doseq [{:keys [record-fn]} commands]
+        (record-fn cmd-buffer-handle))
+
+      ;; End command buffer recording
+      (check-result (VK10/vkEndCommandBuffer cmd-buffer-handle)))
+
+    ;; Return the command buffer
+    cmd-buffer))
+
+;; ============================================================================
+;; Command Buffer Submission and Synchronization
+;; ============================================================================
+
+(defrecord Execution [cmd-buffers queue dependencies metadata])
+
+(defn execute
+  "Creates an execution plan for a command buffer on a queue.
+
+  This is a planning step that does not submit anything to the GPU.
+  Use submit! to actually submit the execution.
+
+  Parameters:
+    cmd-buffer - CommandBuffer to execute (from build!)
+    queue      - Queue (from LogicalDevice :queues) to submit to
+
+  Returns:
+    Execution record that can be chained with wait-for, then-execute, or submit!
+
+  Example:
+    (execute cmd-buffer graphics-queue)
+
+  See also:
+    - submit! for submitting executions
+    - wait-for for adding dependencies
+    - then-execute for chaining executions"
+  [cmd-buffer queue]
+  (->Execution [cmd-buffer] queue [] {}))
+
+(defn wait-for
+  "Adds dependencies to an execution.
+
+  The execution will wait for all dependencies to complete before executing.
+  Creates semaphores internally for cross-queue synchronization.
+
+  Parameters:
+    execution - Execution to add dependencies to
+    deps      - One or more previous Execution records to wait for
+
+  Returns:
+    New Execution with dependencies added
+
+  Example:
+    (wait-for execution prev-execution)
+    (wait-for execution upload1 upload2 upload3)
+
+  See also:
+    - then-execute for a simpler chaining API"
+  [execution & deps]
+  (update execution :dependencies into deps))
+
+(defn then-execute
+  "Chains executions - new execution waits for previous to complete.
+
+  Equivalent to (-> (execute cmd-buffer queue) (wait-for prev-execution))
+
+  Parameters:
+    prev-execution - Execution to wait for
+    cmd-buffer     - CommandBuffer to execute after previous completes
+    queue          - Queue to submit to
+
+  Returns:
+    New Execution with dependency on prev-execution
+
+  Example:
+    (-> (execute compute-cmd compute-queue)
+        (then-execute graphics-cmd graphics-queue)
+        (submit!))
+
+  See also:
+    - execute for creating executions
+    - wait-for for adding multiple dependencies"
+  [prev-execution cmd-buffer queue]
+  (-> (execute cmd-buffer queue)
+      (wait-for prev-execution)))
+
+(defn submit!
+  "Submits an execution to the GPU.
+
+  Creates semaphores for dependencies, submits via vkQueueSubmit, creates a fence
+  for CPU synchronization, and returns a Clojure future.
+
+  Parameters:
+    execution - Execution to submit (from execute/wait-for/then-execute)
+
+  Optional keyword parameters:
+    :on-success - Zero-arity function called when GPU completes successfully
+    :on-error   - One-arity function called with exception if GPU fails
+                  (swallows exception - does not re-throw)
+
+  Returns:
+    Clojure future that:
+    - Blocks on @future or (deref future) until GPU completes
+    - Supports (deref future timeout-ms timeout-val)
+    - Can be checked with (realized? future) without blocking
+    - Returns result of :on-success callback if provided (on success)
+    - Returns result of :on-error callback if provided (on error)
+    - Returns nil if no callbacks provided (on success)
+
+  Example:
+    ;; Block until complete
+    @(submit! execution)
+
+    ;; With success callback
+    (submit! execution :on-success #(println \"GPU done!\"))
+
+    ;; With error callback
+    (submit! execution :on-error #(println \"GPU error:\" %))
+
+    ;; With both callbacks
+    (submit! execution
+             :on-success #(println \"Success!\")
+             :on-error #(println \"Error:\" %))
+
+    ;; With timeout
+    (deref (submit! execution) 1000 :timeout)
+
+  Important:
+    - Semaphores and fence are cleaned up when future is realized
+    - Command buffers are NOT automatically returned to pool
+    - Use callbacks or manual cleanup to return buffers
+    - Error callback swallows exception (use future's exception mechanism to catch)
+
+  See also:
+    - execute for creating executions
+    - wait-for for adding dependencies
+    - then-execute for chaining executions"
+  [execution & {:keys [on-success on-error]}]
+  (let [device (-> execution :queue :logical-device)
+        device-handle (handle device)
+        queue-handle (handle (:queue execution))
+        cmd-buffers (:cmd-buffers execution)
+        dependencies (:dependencies execution)]
+
+    (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+      ;; Create semaphores for dependencies
+      (let [wait-semaphores (when (seq dependencies)
+                              (vec (for [_ dependencies]
+                                     (let [sem-info (-> (VkSemaphoreCreateInfo/calloc stack)
+                                                        (.sType$Default))
+                                           sem-ptr (.mallocLong stack 1)]
+                                       (check-result (VK10/vkCreateSemaphore device-handle sem-info nil sem-ptr))
+                                       (.get sem-ptr 0)))))
+
+            ;; Create fence for CPU synchronization
+            fence-info (-> (VkFenceCreateInfo/calloc stack)
+                           (.sType$Default)
+                           (.flags 0))
+            fence-ptr (.mallocLong stack 1)
+            _ (check-result (VK10/vkCreateFence device-handle fence-info nil fence-ptr))
+            fence-handle (.get fence-ptr 0)
+
+            ;; Cleanup helper function
+            cleanup-fn (fn []
+                         (VK10/vkDestroyFence device-handle fence-handle nil)
+                         (doseq [sem wait-semaphores]
+                           (VK10/vkDestroySemaphore device-handle sem nil)))
+
+            ;; Prepare command buffers
+            cmd-buffer-ptrs (.mallocPointer stack (count cmd-buffers))
+            _ (doseq [[i cmd-buf] (map-indexed vector cmd-buffers)]
+                (.put cmd-buffer-ptrs i (handle cmd-buf)))
+            _ (.flip cmd-buffer-ptrs)
+
+            ;; Prepare wait semaphores (if any)
+            wait-sem-buffer (when (seq wait-semaphores)
+                              (let [buf (.mallocLong stack (count wait-semaphores))]
+                                (doseq [[i sem] (map-indexed vector wait-semaphores)]
+                                  (.put buf i sem))
+                                (.flip buf)))
+
+            ;; Wait stages (use ALL_COMMANDS for Phase 1)
+            wait-stages (when (seq wait-semaphores)
+                          (let [buf (.mallocInt stack (count wait-semaphores))]
+                            (dotimes [i (count wait-semaphores)]
+                              (.put buf i VK10/VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
+                            (.flip buf)))
+
+            ;; Create submit info
+            submit-info (-> (VkSubmitInfo/calloc stack)
+                            (.sType$Default)
+                            (.pCommandBuffers cmd-buffer-ptrs))
+
+            ;; Add wait semaphores if present
+            _ (when wait-sem-buffer
+                (-> submit-info
+                    (.waitSemaphoreCount (count wait-semaphores))
+                    (.pWaitSemaphores wait-sem-buffer)
+                    (.pWaitDstStageMask wait-stages)))]
+
+        ;; Submit to queue
+        (check-result (VK10/vkQueueSubmit queue-handle submit-info fence-handle))
+
+        ;; Create Clojure future that waits on fence
+        (future
+          (try
+            ;; Wait for fence (blocking)
+            (let [fence-buf (doto (.mallocLong (MemoryStack/stackPush) 1)
+                              (.put 0 fence-handle)
+                              (.flip))]
+              (check-result (VK10/vkWaitForFences device-handle fence-buf true Long/MAX_VALUE)))
+
+            ;; Cleanup
+            (cleanup-fn)
+
+            ;; Call success callback if provided
+            (when on-success
+              (on-success))
+
+            (catch Exception e
+              ;; Cleanup on error
+              (cleanup-fn)
+
+              ;; Call error callback if provided (swallows exception)
+              (if on-error
+                (on-error e)
+                ;; Re-throw only if no error callback
+                (throw e)))))))))

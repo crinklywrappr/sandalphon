@@ -5,7 +5,8 @@
         org.lwjgl/lwjgl-vulkan {:mvn/version "3.3.6"}
         org.lwjgl/lwjgl-vma {:mvn/version "3.3.6"}
         org.lwjgl/lwjgl-vma$natives-linux {:mvn/version "3.3.6"}
-        camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}}
+        camel-snake-kebab/camel-snake-kebab {:mvn/version "0.4.3"}
+        org.apache.commons/commons-pool2 {:mvn/version "2.13.0"}}
  :aliases
  {:test
   {:extra-paths ["test"]
