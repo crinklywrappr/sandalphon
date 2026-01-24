@@ -18,7 +18,9 @@
             EXTDebugUtils VK10 VK11 KHRVideoDecodeQueue KHRVideoEncodeQueue NVOpticalFlow]
            [org.lwjgl.util.vma Vma VmaAllocatorCreateInfo VmaAllocationCreateInfo VmaVulkanFunctions]
            [org.apache.commons.pool2 KeyedPooledObjectFactory]
-           [org.apache.commons.pool2.impl DefaultPooledObject GenericKeyedObjectPool]
+           [org.apache.commons.pool2.impl DefaultPooledObject GenericKeyedObjectPool
+            GenericKeyedObjectPoolConfig AbandonedConfig]
+           [java.io Closeable]
            [java.nio ByteBuffer]
            [java.util.concurrent.atomic AtomicLong]))
 
@@ -324,7 +326,7 @@
       (.flip buffer))))
 
 (defrecord Instance [config]
-  java.io.Closeable
+  Closeable
   (close [this]
     (when-let [^VkInstance vk-handle (handle this)]
       ;; Destroy all debug messengers first
@@ -1015,7 +1017,7 @@
   (handle [this]
     (-> this meta :handle))
 
-  java.io.Closeable
+  Closeable
   (close [this]
     (when-let [allocator-handle (handle this)]
       (Vma/vmaDestroyAllocator allocator-handle))))
@@ -1133,7 +1135,7 @@
 ;; ============================================================================
 
 (defrecord LogicalDevice [queue-count physical-device allocator]
-  java.io.Closeable
+  Closeable
   (close [this]
     (when allocator
       (.close allocator))
@@ -1443,7 +1445,7 @@
   (handle [this]
     (-> this meta :handle))
 
-  java.io.Closeable
+  Closeable
   (close [this]
     (let [buffer-handle (handle this)
           allocator (-> this meta :allocator)
@@ -1983,7 +1985,7 @@
   (set (keys command-pool-create-flag-map)))
 
 (defrecord CommandPool [queue-family flags]
-  java.io.Closeable
+  Closeable
   (close [this]
     (let [device (-> this meta :device)
           pool-handle (handle this)]
@@ -2067,7 +2069,7 @@
            :device device})))))
 
 (defrecord CommandBuffer [command-pool level commands]
-  java.io.Closeable
+  Closeable
   (close [this]
     (let [device (-> command-pool meta :device)
           pool-handle (handle command-pool)
@@ -2167,203 +2169,324 @@
 ;; Command Buffer Factory (Apache Commons Pool Integration)
 ;; ============================================================================
 
-(def ^:private vk-cmd-pools (atom {}))
+(defprotocol IBox
+  "Mutable container protocol for use with Apache Commons Pool.
+  Pool objects must be mutable so their contents can be swapped between
+  borrow/return cycles, but Clojure values are immutable. Box bridges
+  this gap by holding a mutable reference to an immutable value."
+  (box-get [this] "Returns the current value without metadata (unlike deref).")
+  (box-set! [this v] "Replaces the contained value. Returns this."))
 
-(def ^:private pre-allocated-buffers (atom {}))
+(deftype Box [^:unsynchronized-mutable state]
+  clojure.lang.IDeref
+  (deref [_] state)
 
-(defn command-buffer-factory!
-  "Creates a KeyedPooledObjectFactory for managing command buffers with pooling.
+  IBox
+  (box-get [_] state)
+  (box-set! [_ v] (set! state v) _))
 
-  INTERNAL API - Not intended for direct use. Use the command buffer allocator instead.
+(defn- borrow
+  "Borrows an object from a GenericKeyedObjectPool, unwraps the Box,
+  and returns the contained value with metadata {:box, :pool, :key}
+  attached so that `return` can restore it later."
+  [pool k]
+  (let [mybox (.borrowObject pool k)]
+    (with-meta @mybox
+      {:box mybox :pool pool :key k})))
 
-  This factory implements Apache Commons Pool's KeyedPooledObjectFactory interface
-  to enable pooling and reuse of command buffers. Command buffers are keyed by:
-    :thread-id    - Thread ID (e.g., from (.getId (Thread/currentThread)))
-    :queue-family - QueueFamily to create pool/buffer for
-    :pool-flags   - Command pool flags (default: #{:reset-command-buffer})
-    :buffer-level - Command buffer level :primary or :secondary (default: :primary)
+(defn- return
+  "Returns a value to the pool it was borrowed from. Uses the {:box, :pool, :key}
+  metadata attached by `borrow` to restore the value into its Box and
+  return the Box to the pool. Inverse of `borrow`."
+  [v]
+  (let [{:keys [box pool] k :key} (meta v)]
+    (box-set! box (vary-meta v dissoc :box :pool :key))
+    (.returnObject pool k box)))
 
-  The factory maintains an internal cache of command pools (one per thread+queue-family
-  combination) and allocates command buffers from those pools. It will use pre-allocated
-  buffers if available, otherwise it creates new ones on-demand.
+(defn command-pool-with-command-buffers-factory!
+  "Creates a KeyedPooledObjectFactory for the backing pool tier.
 
-  Returns:
-    KeyedPooledObjectFactory instance for use with GenericKeyedObjectPool"
-  []
+  Each pooled object is a Box containing {:pool <CommandPool>, :buffers {handle => buffer}}.
+  Keys are {:queue-family, :pool-flags, :buffer-level}.
+
+  On creation, allocates a Vulkan CommandPool and pre-allocates the configured
+  number of command buffers. On activation (re-lending after return), replenishes
+  any missing buffers back to the configured count. On destruction, closes the
+  underlying CommandPool."
+  [device primary-buffer-count secondary-buffer-count]
   (reify
     KeyedPooledObjectFactory
-    (makeObject [_ {:keys [buffer-level] :as k}]
-      ;; Try to use a pre-allocated buffer first
-      (if-let [buf (first (get @pre-allocated-buffers k))]
-        (do
-          ;; Remove the buffer from the pre-allocated pool
-          (swap! pre-allocated-buffers update k rest)
-          (DefaultPooledObject. buf))
-        ;; Fallback: create new buffer from command pool
-        (-> (get @vk-cmd-pools k)
-            (command-buffer! 1 :level buffer-level)
-            first
-            DefaultPooledObject.)))
-    (destroyObject [_ _ pooled-obj]
-      (.close (.getObject pooled-obj)))
-    (validateObject [_ _ pooled-obj]
-      (let [cmd-buffer (.getObject pooled-obj)]
-        (boolean (handle cmd-buffer))))
+    (makeObject [_ {:keys [queue-family pool-flags buffer-level]}]
+      (let [n (if (= buffer-level :secondary)
+                secondary-buffer-count
+                primary-buffer-count)
+            pool (command-pool! device queue-family :flags pool-flags)]
+        (DefaultPooledObject.
+         (->Box {:pool pool
+                 :buffers (reduce
+                           (fn [a b] (assoc a (handle b) b))
+                           {} (command-buffer! pool n :level buffer-level))}))))
+    (destroyObject [_ _ pooled-obj] (.close (:pool (box-get (.getObject pooled-obj)))))
+    (validateObject [_ _ _] true)
+    (activateObject [_ {:keys [buffer-level]} pooled-obj]
+      (let [box (.getObject pooled-obj)
+            state (box-get box)
+            {:keys [pool buffers]} state
+            n (if (= buffer-level :secondary)
+                secondary-buffer-count
+                primary-buffer-count)
+            deficit (- n (count buffers))]
+        (when (pos? deficit)
+          (box-set! box
+                    (assoc state :buffers
+                           (reduce
+                            (fn [a b] (assoc a (handle b) b))
+                            buffers (command-buffer! pool deficit :level buffer-level)))))))
+    (passivateObject [_ _ _] nil)))
+
+(defn get-thread-ids
+  "Returns a set of thread IDs for all currently alive threads."
+  []
+  (transduce
+   (map (comp #(.getId %) key))
+   conj
+   #{} (Thread/getAllStackTraces)))
+
+(defn return-abandoned-pools
+  "Detects entries in borrowed-entries whose owning thread has died,
+  atomically removes them, and returns each to the backing pool.
+  Called periodically by the cleanup daemon thread."
+  [borrowed-entries]
+  (let [thread-ids (get-thread-ids)
+        [old new] (swap-vals! borrowed-entries
+                              (fn [entries]
+                                (reduce-kv
+                                 (fn [acc k _]
+                                   (if (contains? thread-ids (:thread-id k))
+                                     acc
+                                     (dissoc acc k)))
+                                 entries entries)))]
+    (doseq [[k v] old
+            :when (not (contains? new k))]
+      (return (dissoc v :num-loaned)))))
+
+(defn return-all-pools
+  "Atomically drains all entries from borrowed-entries and returns each
+  to the backing pool. Used during allocator shutdown."
+  [borrowed-entries]
+  (let [[old _] (reset-vals! borrowed-entries {})]
+    (doseq [[_ v] old]
+      (return (dissoc v :num-loaned)))))
+
+(defn command-buffer-factory!
+  "Creates a KeyedPooledObjectFactory for the command buffer pool tier.
+
+  Each pooled object is a Box containing a single command buffer.
+  Keys are {:thread-id, :queue-family, :pool-flags, :buffer-level}.
+
+  Backed by borrowed-entries, an atom of
+    {key => {:pool <CommandPool>, :buffers {handle => buffer}, :num-loaned n}}
+  which tracks per-thread pool borrowing from the backing pool.
+
+  On first use of a key, borrows a CommandPool+buffers entry from backing-pool.
+  Subsequent makeObject calls for the same key draw from the pre-allocated
+  :buffers, falling back to fresh allocation when exhausted. On destruction,
+  returns the entry to the backing pool when num-loaned reaches zero."
+  [backing-pool borrowed-entries]
+  (reify
+    KeyedPooledObjectFactory
+    (makeObject [_ {:keys [queue-family pool-flags buffer-level] :as k}]
+      ;; borrow an appropriate pool if one does not exist
+      ;; safe to use a plain check: keys include thread-id, and makeObject
+      ;; always runs on the borrower's thread, so no other thread can add this key
+      (when-not (contains? @borrowed-entries k)
+        (swap! borrowed-entries assoc k
+               (-> (borrow backing-pool {:queue-family queue-family
+                                         :pool-flags pool-flags
+                                         :buffer-level buffer-level})
+                   (assoc :num-loaned 0))))
+      (let [entries @borrowed-entries]
+        (DefaultPooledObject.
+         (->Box
+          (if (seq (get-in entries [k :buffers]))
+            (-> entries (get k) (get :buffers) vals rand-nth)
+            (first (command-buffer! (get-in entries [k :pool]) 1 :level buffer-level)))))))
+    (destroyObject [_ k _]
+      ;; releases the borrowed pool if num-loaned == 0
+      (let [[old new] (swap-vals! borrowed-entries
+                                  (fn [entries]
+                                    (if-let [v (get entries k)]
+                                      (if (zero? (:num-loaned v))
+                                        (dissoc entries k)
+                                        entries)
+                                      entries)))]
+        (when-let [v (get old k)]
+          (when-not (contains? new k)
+            ;; nothing to do with the pooled cmd-buffer itself
+            ;; it will be freed along with the pool,
+            ;; even if sandalphon/users have lost the reference
+            (return (dissoc v :num-loaned))))))
+    (validateObject [_ k _]
+      (contains? @borrowed-entries k))
     (activateObject [_ _ _] nil)
     (passivateObject [_ _ _] nil)))
 
-(defn command-buffer-pool!
-  "Creates a GenericKeyedObjectPool for pooling and reusing command buffers.
-
-  INTERNAL API - Not intended for direct use. Use the command buffer allocator instead.
-
-  This function wraps Apache Commons Pool's GenericKeyedObjectPool with a command
-  buffer factory. The pool manages command buffer lifecycle, including allocation,
-  validation, and cleanup.
-
-  Arities:
-    (command-buffer-pool!)
-      Creates a pool with default configuration.
-
-    (command-buffer-pool! config)
-      Creates a pool with custom GenericKeyedObjectPoolConfig.
-      Common config options:
-        - maxTotalPerKey: Max command buffers per thread+queue-family (default: 8)
-        - maxIdlePerKey: Max idle buffers kept cached per key (default: 8)
-        - minIdlePerKey: Min idle buffers maintained per key (default: 0)
-        - testOnBorrow: Validate buffers when borrowed (default: false)
-        - testOnReturn: Validate buffers when returned (default: false)
-
-    (command-buffer-pool! config abandoned-config)
-      Creates a pool with custom configuration and abandoned object tracking.
-      Use AbandonedConfig to detect and clean up leaked command buffers.
-
-  Returns:
-    GenericKeyedObjectPool instance
-
-  Example:
-    (let [config (doto (GenericKeyedObjectPoolConfig.)
-                   (.setMaxTotalPerKey 16)
-                   (.setMaxIdlePerKey 8))
-          pool (command-buffer-pool! config)]
-      ;; pool is used internally by command buffer allocator
-      ...)
-
-  See also:
-    - Apache Commons Pool documentation
-    - GenericKeyedObjectPoolConfig for configuration options
-    - AbandonedConfig for leak detection"
-  ([] (GenericKeyedObjectPool. (command-buffer-factory!)))
-  ([config] (GenericKeyedObjectPool. (command-buffer-factory!) config))
-  ([config abandoned-config] (GenericKeyedObjectPool. (command-buffer-factory!) config abandoned-config)))
-
-(defrecord CommandBufferAllocator [logical-device command-buffer-pool
-                                   primary-buffer-count secondary-buffer-count])
-
-(defn command-buffer-allocator!
-  "Creates a command buffer allocator for managing pooled command buffers.
-
-  The allocator provides a high-level interface for acquiring and managing command
-  buffers with automatic pooling, per-thread command pool management, and optional
-  pre-allocation for performance.
+(defn default-pool-config
+  "Creates a GenericKeyedObjectPoolConfig with sensible defaults.
+  Validates idle objects during eviction sweeps but not on borrow/return.
 
   Parameters:
-    logical-device - LogicalDevice to create command buffers from
+    max-total-per-key      - maximum pooled objects per key
+    eviction-interval-ms   - milliseconds between eviction sweeps
+    min-evictable-idle-ms  - minimum idle time before an object is eligible for eviction"
+  [max-total-per-key eviction-interval-ms min-evictable-idle-ms]
+  (doto (GenericKeyedObjectPoolConfig.)
+    ;; Pool size limits
+    (.setMaxTotalPerKey max-total-per-key)
+    (.setMaxIdlePerKey (long (/ max-total-per-key 2)))
+    (.setMinIdlePerKey 0)
 
-  Optional keyword parameters:
-    :primary-buffer-count   - Number of primary buffers to pre-allocate (default: 32)
-    :secondary-buffer-count - Number of secondary buffers to pre-allocate (default: 0)
-    :config                 - GenericKeyedObjectPoolConfig for custom pool configuration
-    :abandoned-config       - AbandonedConfig for leak detection
+    ;; Idle eviction - automatic resource cleanup
+    (.setTimeBetweenEvictionRunsMillis eviction-interval-ms)
+    (.setMinEvictableIdleTimeMillis min-evictable-idle-ms)
+    (.setNumTestsPerEvictionRun -1) ; test ALL idle objects
+    (.setTestWhileIdle true)
 
-  Returns:
-    CommandBufferAllocator instance
+    ;; Validation - enabled for safety
+    (.setTestOnBorrow true)
+    (.setTestOnReturn true)))
 
-  Example:
-    (let [allocator (command-buffer-allocator! device
-                      :primary-buffer-count 64
-                      :secondary-buffer-count 16)]
-      ;; Use with acquire-command-builder to get builders
-      ...)
+(defrecord CommandBufferAllocator [primary-buffer-count secondary-buffer-count]
+  Closeable
+  (close [this]
+    (let [{:keys [running cleanup-thread cmd-buffer-pool backing-pool borrowed-entries]} (meta this)]
+      (reset! running false)
+      (.interrupt cleanup-thread)
+      (.join cleanup-thread)
+      (return-all-pools borrowed-entries)
+      (.close cmd-buffer-pool)
+      (.close backing-pool))))
 
-  See also:
-    - acquire-command-builder for borrowing command buffers from the allocator"
-  [logical-device & {:keys [primary-buffer-count secondary-buffer-count config abandoned-config]
-                     :or {primary-buffer-count 32 secondary-buffer-count 0}}]
-  (let [pool (if abandoned-config
-               (command-buffer-pool! config abandoned-config)
-               (if config
-                 (command-buffer-pool! config)
-                 (command-buffer-pool!)))]
-    (->CommandBufferAllocator logical-device pool primary-buffer-count secondary-buffer-count)))
+(defn command-buffer-allocator!
+  "Creates a two-tier command buffer allocator. Implements Closeable.
+
+  The backing pool manages Vulkan CommandPools with pre-allocated buffers,
+  keyed by {:queue-family, :pool-flags, :buffer-level}. The command buffer
+  pool manages individual buffers per thread, borrowing from the backing
+  pool on demand.
+
+  A daemon thread reclaims entries from dead threads periodically.
+
+  Parameters:
+    logical-device           - the Vulkan logical device
+    :primary-buffer-count    - pre-allocated primary buffers per CommandPool (default 32)
+    :secondary-buffer-count  - pre-allocated secondary buffers per CommandPool (default 0)
+    :backing-pool-size       - max CommandPool+buffers entries per key (default 8)
+    :cleanup-interval-ms     - milliseconds between dead-thread reclamation sweeps (default 120000)
+    :eviction-interval-ms    - milliseconds between idle object eviction sweeps (default 60000)
+    :min-evictable-idle-ms   - minimum idle time before eviction eligibility (default 300000)
+    :log-abandoned           - log stack traces when leaked command buffers are detected (default false)
+    :use-usage-tracking      - track last usage point for more precise leak diagnostics (default false)
+
+  Allocator state is stored in metadata:
+    :borrowed-entries  - atom tracking per-thread pool borrowing
+    :backing-pool      - GenericKeyedObjectPool of CommandPool+buffers
+    :cmd-buffer-pool   - GenericKeyedObjectPool of individual command buffers
+    :cleanup-thread    - daemon thread for dead-thread reclamation
+    :running           - atom controlling cleanup thread lifecycle"
+  [logical-device & {:keys [primary-buffer-count secondary-buffer-count
+                            backing-pool-size cleanup-interval-ms
+                            eviction-interval-ms min-evictable-idle-ms
+                            log-abandoned use-usage-tracking]
+                     :or {primary-buffer-count 32
+                          secondary-buffer-count 0
+                          backing-pool-size 8
+                          cleanup-interval-ms 120000
+                          eviction-interval-ms 60000
+                          min-evictable-idle-ms 300000
+                          log-abandoned false
+                          use-usage-tracking false}}]
+  (let [borrowed-entries (atom {})
+        backing-pool (GenericKeyedObjectPool.
+                      (command-pool-with-command-buffers-factory!
+                       logical-device primary-buffer-count secondary-buffer-count)
+                      (default-pool-config backing-pool-size
+                                           eviction-interval-ms
+                                           min-evictable-idle-ms))
+        cmd-buffer-pool (GenericKeyedObjectPool.
+                         (command-buffer-factory!
+                          backing-pool borrowed-entries)
+                         (default-pool-config
+                          (max primary-buffer-count
+                               secondary-buffer-count)
+                          eviction-interval-ms
+                          min-evictable-idle-ms)
+                         (doto (AbandonedConfig.)
+                           (.setLogAbandoned log-abandoned)
+                           (.setUseUsageTracking use-usage-tracking)))
+        running (atom true)
+        cleanup-thread (doto (Thread.
+                              (fn []
+                                (while @running
+                                  (try
+                                    (Thread/sleep cleanup-interval-ms)
+                                    (when @running
+                                      (return-abandoned-pools borrowed-entries))
+                                    (catch InterruptedException _)
+                                    (catch Exception e
+                                      (.printStackTrace e))))))
+                         (.setName "sandalphon-abandoned-pool-cleanup")
+                         (.setDaemon true)
+                         (.start))]
+    (with-meta (->CommandBufferAllocator primary-buffer-count secondary-buffer-count)
+      {:borrowed-entries borrowed-entries
+       :backing-pool backing-pool
+       :cmd-buffer-pool cmd-buffer-pool
+       :cleanup-thread cleanup-thread
+       :running running})))
 
 (defrecord CommandBufferBuilder [commands-to-record])
 
-(defn acquire-command-builder
-  "Acquires a command buffer builder from the allocator for recording commands.
+(defn command-buffer-builder!
+  "Creates a CommandBufferBuilder for recording commands into a pooled
+  command buffer. The command buffer is stored in metadata under :pooled-buffer."
+  [cmd-buffer]
+  (with-meta (->CommandBufferBuilder []) {:pooled-buffer cmd-buffer}))
 
-  This function borrows a command buffer from the underlying pool and wraps it in
-  a builder interface. The builder allows you to queue commands that will be recorded
-  when you call the recording function.
-
-  The command buffer is automatically associated with the current thread and the
-  specified queue family, ensuring thread-safe command pool usage.
-
-  Parameters:
-    command-buffer-allocator - CommandBufferAllocator to borrow from
-    queue-family            - QueueFamily this command buffer will be submitted to
-
-  Optional keyword parameters:
-    :pool-flags   - Command pool creation flags (default: #{:reset-command-buffer})
-    :buffer-level - Command buffer level :primary or :secondary (default: :primary)
-
-  Returns:
-    CommandBufferBuilder with the borrowed command buffer in metadata
-
-  Example:
-    (let [builder (acquire-command-builder allocator graphics-family
-                    :buffer-level :primary)]
-      ;; Queue commands on the builder
-      ;; ...
-      ;; Return builder to pool when done
-      )
-
-  Important:
-    The borrowed command buffer MUST be returned to the pool after use, either by
-    calling a return/release function or through automatic cleanup. Failure to
-    return buffers will leak resources.
-
-  See also:
-    - command-buffer-allocator! for creating allocators"
+(defn borrow-command-buffer
+  "Borrows a command buffer from the allocator for the current thread.
+  The buffer is bound to the calling thread's ID, queue-family, pool-flags,
+  and buffer-level. Returns a command buffer with :cmd-buffer-allocator
+  in its metadata for use with `return-command-buffer`."
   [cmd-buffer-allocator queue-family
    & {:keys [pool-flags buffer-level]
       :or {buffer-level :primary pool-flags #{:reset-command-buffer}}}]
-  (let [thread-id (.getId (Thread/currentThread))
-        logical-device (:logical-device cmd-buffer-allocator)
-        cmd-buffer-pool (:command-buffer-pool cmd-buffer-allocator)
-        k {:thread-id thread-id
+  (let [{:keys [cmd-buffer-pool borrowed-entries]} (meta cmd-buffer-allocator)
+        k {:thread-id (.getId (Thread/currentThread))
            :queue-family queue-family
            :pool-flags pool-flags
-           :buffer-level buffer-level}]
-    (if (some (partial = k) (.getKeys cmd-buffer-pool))
-      ;; Pool for this key already exists, borrow from it
-      (with-meta (->CommandBufferBuilder [])
-        {:pooled-buffer (.borrowObject cmd-buffer-pool k)})
-      ;; First time for this key: create pool and pre-allocate buffers
-      (let [cmd-pool (command-pool! logical-device queue-family :flags pool-flags)
-            buffer-count (if (= buffer-level :secondary)
-                           (:secondary-buffer-count cmd-buffer-allocator)
-                           (:primary-buffer-count cmd-buffer-allocator))
-            cmd-buffers (command-buffer! cmd-pool buffer-count :level buffer-level)]
-        ;; Store the command pool
-        (swap! vk-cmd-pools assoc k cmd-pool)
-        ;; Store the pre-allocated buffers
-        (swap! pre-allocated-buffers assoc k cmd-buffers)
-        ;; Add objects to the pool (will consume pre-allocated buffers)
-        (.addObjects cmd-buffer-pool k buffer-count)
-        ;; Borrow one for the caller
-        (with-meta (->CommandBufferBuilder [])
-          {:pooled-buffer (.borrowObject cmd-buffer-pool k)})))))
+           :buffer-level buffer-level}
+        cmd-buffer (borrow cmd-buffer-pool k)]
+    (swap! borrowed-entries
+           (fn [entries]
+             (-> entries
+                 (update-in [k :num-loaned] inc)
+                 (update-in [k :buffers] dissoc (handle cmd-buffer)))))
+    (vary-meta cmd-buffer assoc :cmd-buffer-allocator cmd-buffer-allocator)))
+
+(defn return-command-buffer
+  "Returns a command buffer to the allocator it was borrowed from.
+  Decrements the loan count, restores the buffer to the available set,
+  and returns the underlying Box to the command buffer pool."
+  [cmd-buffer]
+  (let [k (-> cmd-buffer meta :key)
+        borrowed-entries (-> cmd-buffer meta :cmd-buffer-allocator meta :borrowed-entries)]
+    (swap! borrowed-entries
+           (fn [entries]
+             (-> entries
+                 (update-in [k :num-loaned] dec)
+                 (update-in [k :buffers] assoc (handle cmd-buffer) cmd-buffer))))
+    (return (vary-meta cmd-buffer dissoc :cmd-buffer-allocator))))
 
 ;; ============================================================================
 ;; Command Buffer Recording
@@ -2555,6 +2678,7 @@
     - Returns result of :on-success callback if provided (on success)
     - Returns result of :on-error callback if provided (on error)
     - Returns nil if no callbacks provided (on success)
+    - Throws an exception if :on-error callback not provided (on error)
 
   Example:
     ;; Block until complete

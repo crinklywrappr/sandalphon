@@ -75,6 +75,29 @@ Vulkan resources (Instance, PhysicalDevice, etc.) wrap native handles that becom
 
 ## Roadmap
 
+### Use-After-Free Detection and Prevention
+
+Vulkan resources (command buffers, buffers, images, etc.) wrap native handles that become dangling pointers after being freed. Currently, there is no runtime protection against use-after-free bugs.
+
+**The Problem:**
+- After calling `.close()` on a resource, the handle remains in metadata as a `long` value
+- Attempting to use the freed resource causes segfaults or undefined behavior
+- Validation layers cannot catch this (the object is already destroyed)
+- Pool validation cannot detect freed handles (they're just memory addresses)
+
+**Planned Solutions:**
+- **Handle invalidation** - Set handles to sentinel value (e.g., `0` or `-1`) after destruction
+- **Access tracking** - Track which resources are borrowed/active, detect use-after-return
+- **Generation counters** - Add generation IDs to detect stale references
+- **Debug mode assertions** - Runtime checks that throw clear errors instead of segfaulting
+
+**Benefits:**
+- Catch bugs earlier with clear error messages
+- Safer pool implementations (can validate handles are not freed)
+- Better debugging experience (no mysterious segfaults)
+
+**Current Status:** Not yet implemented. Resources can be used after being freed with no protection.
+
 ### Device Limits and Sparse Properties
 
 Physical device limits and sparse memory properties are currently returned as raw LWJGL struct objects. These should be converted to idiomatic Clojure data structures.
