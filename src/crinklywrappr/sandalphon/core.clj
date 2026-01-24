@@ -975,7 +975,7 @@
           (.pNext 0)
           (.pPhysicalDevices device-handles)))))
 
-(defrecord Queue [queue-family]
+(defrecord Queue [queue-family logical-device]
   IVulkanHandle
   (handle [this]
     (-> this meta :handle))
@@ -1002,7 +1002,7 @@
      (let [queue-ptr (.mallocPointer stack 1)]
        (VK10/vkGetDeviceQueue vk-handle family-idx queue-idx queue-ptr)
        (let [vk-queue (VkQueue. (.get queue-ptr 0) vk-handle)]
-         (with-meta (->Queue (dissoc queue-family :max-queue-count))
+         (with-meta (map->Queue {:queue-family (dissoc queue-family :max-queue-count)})
            {:handle vk-queue
             :queue-index queue-idx}))))))
 
@@ -1132,7 +1132,7 @@
 ;; Logical Device Creation
 ;; ============================================================================
 
-(defrecord LogicalDevice [queues physical-device allocator]
+(defrecord LogicalDevice [queue-count physical-device allocator]
   java.io.Closeable
   (close [this]
     (when allocator
@@ -1262,13 +1262,39 @@
         (let [vk-handle (VkDevice. (.get device-ptr 0) phys-dev-handle device-info)
               queues (create-queues vk-handle queue-requests-map stack)
               allocator (memory-allocator! vk-handle physical-device' stack :flags (or allocator-flags #{}))
-              config (cond-> {:queues queues
+              config (cond-> {:queue-count (count queues)
                               :physical-device physical-device'
                               :allocator allocator}
                        physical-device-group (assoc :physical-device-group physical-device-group)
                        (seq enabled-extensions) (assoc :enabled-extensions (vec enabled-extensions))
                        (seq enabled-features) (assoc :enabled-features (set enabled-features)))]
-          (with-meta (map->LogicalDevice config) {:handle vk-handle}))))))
+          (with-meta (map->LogicalDevice config) {:handle vk-handle :queues queues}))))))
+
+(defn queues
+  "Returns a vector of Queue records for a logical device.
+
+  Each Queue record includes a :logical-device field that references the
+  logical device it belongs to. This allows queue-centric APIs to access
+  the device handle for operations like creating synchronization primitives.
+
+  Parameters:
+    logical-device - LogicalDevice record
+
+  Returns:
+    Vector of Queue records, each with :logical-device field
+
+  Example:
+    (let [device (logical-device! physical-device ...)
+          qs (queues device)
+          graphics-queue (first qs)]
+      (submit! (execute cmd-buffer graphics-queue)))
+
+  Note:
+    Queues are not explicitly destroyed - their lifetime is tied to the
+    logical device and they are automatically cleaned up when the device
+    is closed."
+  [logical-device]
+  (mapv #(assoc % :logical-device logical-device) (:queues (meta logical-device))))
 
 ;; ============================================================================
 ;; Buffer Creation - Flags and Enums
@@ -1529,7 +1555,7 @@
 
   ;; Validate that queue families have queues on the device
   (when (seq queue-families)
-    (let [device-queue-family-indices (set (map (comp index :queue-family) (:queues device)))
+    (let [device-queue-family-indices (set (map (comp index :queue-family) (:queues (meta device))))
           requested-indices (map index queue-families)
           invalid-indices (remove device-queue-family-indices requested-indices)]
       (when (seq invalid-indices)
@@ -2011,7 +2037,7 @@
   (validate-flag-keywords command-pool-create-flag-map flags "flags" "command-pool-create-flags")
 
   ;; Validate that queue-family has queues on the device
-  (let [device-queue-family-indices (set (map (comp index :queue-family) (:queues device)))
+  (let [device-queue-family-indices (set (map (comp index :queue-family) (:queues (meta device))))
         queue-family-index (index queue-family)]
     (when-not (contains? device-queue-family-indices queue-family-index)
       (throw (ex-info "Queue family does not have queues on the device"

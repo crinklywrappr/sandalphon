@@ -152,8 +152,8 @@
             (is (instance? crinklywrappr.sandalphon.core.LogicalDevice device))
             (is (instance? java.io.Closeable device))
             (is (some? (handle device)))
-            (is (vector? (:queues device)))
-            (is (= 1 (count (:queues device))))
+            (is (vector? (vk/queues device)))
+            (is (= 1 (count (vk/queues device))))
             (println "  ✓ Created device with 1 queue")))
 
         (testing "Device creation with multiple queue families"
@@ -162,7 +162,7 @@
                                 :physical-device physical-device
                                 :queue-requests [(first queue-families)
                                                 (second queue-families)])]
-              (is (= 2 (count (:queues device))))
+              (is (= 2 (count (vk/queues device))))
               (println (str "  ✓ Created device with 2 queues from 2 families")))))
 
         (testing "Device creation with queue-builder and custom queue count"
@@ -175,7 +175,7 @@
                                     :physical-device physical-device
                                     :queue-requests [(vk/queue-builder family-with-multiple
                                                                        :queue-count requested-count)])]
-                  (is (= requested-count (count (:queues device))))
+                  (is (= requested-count (count (vk/queues device))))
                   (println (str "  ✓ Created device with " requested-count " queues using queue-builder")))))))
 
         (testing "Device creation with custom priorities"
@@ -186,7 +186,7 @@
                                   :physical-device physical-device
                                   :queue-requests [(vk/queue-builder family-with-multiple
                                                                      :priorities [1.0 0.5])])]
-                (is (= 2 (count (:queues device))))
+                (is (= 2 (count (vk/queues device))))
                 (println "  ✓ Created device with custom priorities")))))
 
         (testing "Mixed queue families and queue builders"
@@ -195,14 +195,14 @@
                                 :physical-device physical-device
                                 :queue-requests [(first queue-families)
                                                 (vk/queue-builder (second queue-families) :queue-count 1)])]
-              (is (= 2 (count (:queues device))))
+              (is (= 2 (count (vk/queues device))))
               (println "  ✓ Created device with mixed queue requests"))))
 
         (testing "Queue record validation"
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (let [queue (first (:queues device))]
+            (let [queue (first (vk/queues device))]
               (is (instance? crinklywrappr.sandalphon.core.Queue queue))
               (is (instance? crinklywrappr.sandalphon.core.QueueFamily (:queue-family queue)))
               (is (some? (handle queue)) "Queue should have VkQueue handle")
