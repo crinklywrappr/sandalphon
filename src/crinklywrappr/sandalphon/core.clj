@@ -4,6 +4,7 @@
             [clojure.string :as sg]
             [clojure.reflect :as reflect]
             [camel-snake-kebab.core :as csk]
+            [taoensso.trove :as log]
             [crinklywrappr.sandalphon.protocols :refer [IVulkanHandle PropertyQueryable Indexable
                                                         handle properties index]])
   (:import [org.lwjgl.system MemoryStack MemoryUtil]
@@ -2730,8 +2731,10 @@
                                                  (VK10/vkQueueWaitIdle (handle q)))]
                                     (if (= result VK10/VK_SUCCESS)
                                       (recur (next queues))
-                                      (binding [*out* *err*]
-                                        (println "submit!: vkQueueWaitIdle failed with error code:" result)))))))
+                                      (log/log! {:level :error
+                                                 :id ::submit!$wait-for-queues
+                                                 :msg (error-message result)
+                                                 :data {:error-code result}}))))))
 
             cleanup-sync (fn []
                            (when-let [f @fence-handle]
@@ -2743,9 +2746,11 @@
                                   (doseq [cb @all-cmd-buffers]
                                     (try
                                       (return-command-buffer cb)
-                                      (catch Exception e
-                                        (binding [*out* *err*]
-                                          (println "submit!: failed to return command buffer:" (.getMessage e)))))))]
+                                      (catch Exception ex
+                                        (log/log! {:level :error
+                                                   :id ::submit!$cleanup-cmd-buffers
+                                                   :msg "Failed to return command buffer"
+                                                   :data {:error (.getMessage ex)}})))))]
 
         (try
           ;; Initialize semaphore maps
