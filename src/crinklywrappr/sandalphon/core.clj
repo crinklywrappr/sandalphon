@@ -2445,14 +2445,6 @@
        :cleanup-thread cleanup-thread
        :running running})))
 
-(defrecord CommandBufferBuilder [commands-to-record])
-
-(defn command-buffer-builder!
-  "Creates a CommandBufferBuilder for recording commands into a pooled
-  command buffer. The command buffer is stored in metadata under :pooled-buffer."
-  [cmd-buffer]
-  (with-meta (->CommandBufferBuilder []) {:pooled-buffer cmd-buffer}))
-
 (defn borrow-command-buffer
   "Borrows a command buffer from the allocator for the current thread.
   The buffer is bound to the calling thread's ID, queue-family, pool-flags,
@@ -2521,14 +2513,14 @@
   (set (keys command-buffer-usage-flag-map)))
 
 (defn build!
-  "Records all queued commands to the command buffer and returns it.
+  "Finalizes a command builder by prepending a begin-command-buffer record
+  and appending an end-command-buffer record to the queued commands.
 
-  This function begins command buffer recording, executes all queued command
-  functions, and ends recording. The resulting command buffer is ready to be
-  submitted to a queue.
+  The resulting builder contains a complete command sequence ready for
+  recording to a command buffer during submission.
 
   Parameters:
-    builder - CommandBufferBuilder with queued commands
+    builder - builder map with :commands-to-record
 
   Optional keyword parameters:
     :usage - Set of command buffer usage flags (default: #{})
@@ -2538,76 +2530,64 @@
              :simultaneous-use      - Can be submitted multiple times while pending
 
   Returns:
-    The underlying CommandBuffer, ready to submit
+    Builder map with begin/end records wrapping the queued commands.
 
   Example:
-    (-> builder
-        (copy-buffer! src dst)
-        (fill-buffer! dst 0)
-        (build! :usage #{:one-time-submit}))
-
-  Important:
-    After build!, the command buffer is in the executable state. It should be
-    submitted to a queue or returned to the pool. Do not call build! multiple
-    times on the same builder."
+    (-> (copy-buffer! src dst {:regions [{:src-offset 0 :dst-offset 0 :size 1024}]})
+        (fill-buffer! dst 0 {:offset 0 :size 256})
+        (build! :usage #{:one-time-submit}))"
   [builder & {:keys [usage]
               :or {usage #{}}}]
 
   ;; Validate usage flags
   (validate-flag-keywords command-buffer-usage-flag-map usage "usage" "command-buffer-usage-flags")
 
-  (let [pooled-buffer (-> builder meta :pooled-buffer)
-        cmd-buffer (.getObject pooled-buffer)
-        cmd-buffer-handle (handle cmd-buffer)
-        commands (:commands-to-record builder)
-        usage-flags (flags->int command-buffer-usage-flag-map usage)]
-
-    (with-open [^MemoryStack stack (MemoryStack/stackPush)]
-      ;; Begin command buffer recording
-      (let [begin-info (-> (VkCommandBufferBeginInfo/calloc stack)
-                           (.sType$Default)
-                           (.flags usage-flags)
-                           (.pInheritanceInfo nil))]
-        (check-result (VK10/vkBeginCommandBuffer cmd-buffer-handle begin-info)))
-
-      ;; Execute all queued commands
-      (doseq [{:keys [record-fn]} commands]
-        (record-fn cmd-buffer-handle))
-
-      ;; End command buffer recording
-      (check-result (VK10/vkEndCommandBuffer cmd-buffer-handle)))
-
-    ;; Return the command buffer
-    cmd-buffer))
+  (let [usage-flags (flags->int command-buffer-usage-flag-map usage)
+        begin-cmd {:name :begin-command-buffer
+                   :args {:usage usage-flags}
+                   :record-fn (fn [cmd-buffer-handle]
+                                (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+                                  (let [begin-info (-> (VkCommandBufferBeginInfo/calloc stack)
+                                                       (.sType$Default)
+                                                       (.flags usage-flags)
+                                                       (.pInheritanceInfo nil))]
+                                    (check-result (VK10/vkBeginCommandBuffer cmd-buffer-handle begin-info)))))}
+        end-cmd {:name :end-command-buffer
+                 :args {}
+                 :record-fn (fn [cmd-buffer-handle]
+                              (check-result (VK10/vkEndCommandBuffer cmd-buffer-handle)))}]
+    (update builder :commands-to-record
+            (fn [commands]
+              (into [begin-cmd] (conj (vec commands) end-cmd))))))
 
 ;; ============================================================================
 ;; Command Buffer Submission and Synchronization
 ;; ============================================================================
 
-(defrecord Execution [cmd-buffers queue dependencies metadata])
+(defrecord Execution [cmd-builders queue dependencies])
 
 (defn execute
-  "Creates an execution plan for a command buffer on a queue.
+  "Creates an execution plan for a command builder on a queue.
 
   This is a planning step that does not submit anything to the GPU.
   Use submit! to actually submit the execution.
 
   Parameters:
-    cmd-buffer - CommandBuffer to execute (from build!)
-    queue      - Queue (from LogicalDevice :queues) to submit to
+    cmd-builder - builder map with :commands-to-record (from build!)
+    queue       - Queue (from LogicalDevice :queues) to submit to
 
   Returns:
     Execution record that can be chained with wait-for, then-execute, or submit!
 
   Example:
-    (execute cmd-buffer graphics-queue)
+    (execute cmd-builder graphics-queue)
 
   See also:
     - submit! for submitting executions
     - wait-for for adding dependencies
     - then-execute for chaining executions"
-  [cmd-buffer queue]
-  (->Execution [cmd-buffer] queue [] {}))
+  [cmd-builder queue]
+  (->Execution [cmd-builder] queue [] {}))
 
 (defn wait-for
   "Adds dependencies to an execution.
@@ -2620,7 +2600,7 @@
     deps      - One or more previous Execution records to wait for
 
   Returns:
-    New Execution with dependencies added
+    Execution with dependencies added.
 
   Example:
     (wait-for execution prev-execution)
@@ -2634,36 +2614,57 @@
 (defn then-execute
   "Chains executions - new execution waits for previous to complete.
 
-  Equivalent to (-> (execute cmd-buffer queue) (wait-for prev-execution))
+  Equivalent to (-> (execute cmd-builder queue) (wait-for prev-execution))
 
   Parameters:
     prev-execution - Execution to wait for
-    cmd-buffer     - CommandBuffer to execute after previous completes
+    cmd-builder    - builder map with :commands-to-record (from build!)
     queue          - Queue to submit to
 
   Returns:
-    New Execution with dependency on prev-execution
+    New Execution with dependency on prev-execution.
 
   Example:
-    (-> (execute compute-cmd compute-queue)
-        (then-execute graphics-cmd graphics-queue)
+    (-> (execute compute-builder compute-queue)
+        (then-execute graphics-builder graphics-queue)
         (submit!))
 
   See also:
     - execute for creating executions
     - wait-for for adding multiple dependencies"
-  [prev-execution cmd-buffer queue]
-  (-> (execute cmd-buffer queue)
+  [prev-execution cmd-builder queue]
+  (-> (execute cmd-builder queue)
       (wait-for prev-execution)))
 
-(defn submit!
-  "Submits an execution to the GPU.
+(defn- topological-sort-executions
+  "Returns executions in dependency-first order via post-order DFS.
+  Uses object identity to handle duplicate references in the DAG."
+  [root]
+  (let [visited (java.util.IdentityHashMap.)
+        result (volatile! [])]
+    (letfn [(visit [node]
+              (when-not (.containsKey visited node)
+                (.put visited node true)
+                (doseq [dep (:dependencies node)]
+                  (visit dep))
+                (vswap! result conj node)))]
+      (visit root))
+    @result))
 
-  Creates semaphores for dependencies, submits via vkQueueSubmit, creates a fence
-  for CPU synchronization, and returns a Clojure future.
+(defn submit!
+  "Submits an execution tree to the GPU.
+
+  Walks the execution dependency tree, topologically sorts the nodes, and
+  submits each to its queue with semaphore-based synchronization. Command
+  buffers are borrowed from the allocator, recorded, submitted, and
+  automatically returned after GPU completion.
+
+  All command pool operations (borrow, record, return) execute on the future's
+  thread, ensuring single-threaded access to each VkCommandPool.
 
   Parameters:
-    execution - Execution to submit (from execute/wait-for/then-execute)
+    cmd-buffer-allocator - allocator to borrow command buffers from
+    execution            - root Execution to submit (from execute/wait-for/then-execute)
 
   Optional keyword parameters:
     :on-success - Zero-arity function called when GPU completes successfully
@@ -2681,121 +2682,188 @@
     - Throws an exception if :on-error callback not provided (on error)
 
   Example:
-    ;; Block until complete
-    @(submit! execution)
+    ;; Simple submission
+    @(submit! allocator (execute builder queue))
 
-    ;; With success callback
-    (submit! execution :on-success #(println \"GPU done!\"))
+    ;; With dependencies
+    @(submit! allocator
+              (-> (execute transfer-builder transfer-queue)
+                  (then-execute graphics-builder graphics-queue)))
 
-    ;; With error callback
-    (submit! execution :on-error #(println \"GPU error:\" %))
-
-    ;; With both callbacks
-    (submit! execution
-             :on-success #(println \"Success!\")
-             :on-error #(println \"Error:\" %))
-
-    ;; With timeout
-    (deref (submit! execution) 1000 :timeout)
+    ;; With callbacks
+    (submit! allocator execution
+             :on-success #(println \"GPU done!\")
+             :on-error #(println \"GPU error:\" %))
 
   Important:
-    - Semaphores and fence are cleaned up when future is realized
-    - Command buffers are NOT automatically returned to pool
-    - Use callbacks or manual cleanup to return buffers
-    - Error callback swallows exception (use future's exception mechanism to catch)
+    - All executions in the tree must use queues from the same logical device
+    - Semaphores, fence, and command buffers are cleaned up automatically
+    - Queue submissions are serialized per-queue via locking
+    - Error callback swallows exception
 
   See also:
     - execute for creating executions
     - wait-for for adding dependencies
     - then-execute for chaining executions"
-  [execution & {:keys [on-success on-error]}]
-  (let [device (-> execution :queue :logical-device)
-        device-handle (handle device)
-        queue-handle (handle (:queue execution))
-        cmd-buffers (:cmd-buffers execution)
-        dependencies (:dependencies execution)]
+  [cmd-buffer-allocator execution & {:keys [on-success on-error]}]
+  (let [sorted (topological-sort-executions execution)]
+    (future
+      (let [device (-> execution :queue :logical-device)
+            device-handle (handle device)
 
-    (with-open [^MemoryStack stack (MemoryStack/stackPush)]
-      ;; Create semaphores for dependencies
-      (let [wait-semaphores (when (seq dependencies)
-                              (vec (for [_ dependencies]
-                                     (let [sem-info (-> (VkSemaphoreCreateInfo/calloc stack)
-                                                        (.sType$Default))
-                                           sem-ptr (.mallocLong stack 1)]
-                                       (check-result (VK10/vkCreateSemaphore device-handle sem-info nil sem-ptr))
-                                       (.get sem-ptr 0)))))
+            ;; Resource tracking for cleanup
+            all-semaphores (volatile! [])
+            all-cmd-buffers (volatile! [])
+            submitted-queues (volatile! #{})
+            fence-handle (volatile! nil)
 
-            ;; Create fence for CPU synchronization
-            fence-info (-> (VkFenceCreateInfo/calloc stack)
-                           (.sType$Default)
-                           (.flags 0))
-            fence-ptr (.mallocLong stack 1)
-            _ (check-result (VK10/vkCreateFence device-handle fence-info nil fence-ptr))
-            fence-handle (.get fence-ptr 0)
+            ;; Per-node semaphore maps (identity-based for DAG correctness)
+            wait-sems-for (java.util.IdentityHashMap.)
+            signal-sems-for (java.util.IdentityHashMap.)
 
-            ;; Cleanup helper function
-            cleanup-fn (fn []
-                         (VK10/vkDestroyFence device-handle fence-handle nil)
-                         (doseq [sem wait-semaphores]
-                           (VK10/vkDestroySemaphore device-handle sem nil)))
+            ;; Cleanup helpers
+            wait-for-queues (fn []
+                              (loop [queues (seq @submitted-queues)]
+                                (when queues
+                                  (let [q (first queues)
+                                        result (locking q
+                                                 (VK10/vkQueueWaitIdle (handle q)))]
+                                    (if (= result VK10/VK_SUCCESS)
+                                      (recur (next queues))
+                                      (binding [*out* *err*]
+                                        (println "submit!: vkQueueWaitIdle failed with error code:" result)))))))
 
-            ;; Prepare command buffers
-            cmd-buffer-ptrs (.mallocPointer stack (count cmd-buffers))
-            _ (doseq [[i cmd-buf] (map-indexed vector cmd-buffers)]
-                (.put cmd-buffer-ptrs i (handle cmd-buf)))
-            _ (.flip cmd-buffer-ptrs)
+            cleanup-sync (fn []
+                           (when-let [f @fence-handle]
+                             (VK10/vkDestroyFence device-handle f nil))
+                           (doseq [sem @all-semaphores]
+                             (VK10/vkDestroySemaphore device-handle sem nil)))
 
-            ;; Prepare wait semaphores (if any)
-            wait-sem-buffer (when (seq wait-semaphores)
-                              (let [buf (.mallocLong stack (count wait-semaphores))]
-                                (doseq [[i sem] (map-indexed vector wait-semaphores)]
-                                  (.put buf i sem))
-                                (.flip buf)))
+            cleanup-cmd-buffers (fn []
+                                  (doseq [cb @all-cmd-buffers]
+                                    (try
+                                      (return-command-buffer cb)
+                                      (catch Exception e
+                                        (binding [*out* *err*]
+                                          (println "submit!: failed to return command buffer:" (.getMessage e)))))))]
 
-            ;; Wait stages (use ALL_COMMANDS for Phase 1)
-            wait-stages (when (seq wait-semaphores)
-                          (let [buf (.mallocInt stack (count wait-semaphores))]
-                            (dotimes [i (count wait-semaphores)]
-                              (.put buf i VK10/VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
-                            (.flip buf)))
+        (try
+          ;; Initialize semaphore maps
+          (doseq [node sorted]
+            (.put wait-sems-for node [])
+            (.put signal-sems-for node []))
 
-            ;; Create submit info
-            submit-info (-> (VkSubmitInfo/calloc stack)
-                            (.sType$Default)
-                            (.pCommandBuffers cmd-buffer-ptrs))
+          ;; Create one semaphore per dependency edge
+          ;; (binary semaphores are single-signal/single-wait in Vulkan 1.0)
+          (doseq [node sorted
+                  dep (:dependencies node)]
+            (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+              (let [sem-info (-> (VkSemaphoreCreateInfo/calloc stack)
+                                 (.sType$Default))
+                    sem-ptr (.mallocLong stack 1)]
+                (check-result (VK10/vkCreateSemaphore device-handle sem-info nil sem-ptr))
+                (let [sem (.get sem-ptr 0)]
+                  (vswap! all-semaphores conj sem)
+                  (.put signal-sems-for dep (conj (.get signal-sems-for dep) sem))
+                  (.put wait-sems-for node (conj (.get wait-sems-for node) sem))))))
 
-            ;; Add wait semaphores if present
-            _ (when wait-sem-buffer
-                (-> submit-info
-                    (.waitSemaphoreCount (count wait-semaphores))
-                    (.pWaitSemaphores wait-sem-buffer)
-                    (.pWaitDstStageMask wait-stages)))]
+          ;; Submit each node in topological order (dependencies first)
+          (doseq [exec sorted]
+            (let [queue (:queue exec)
+                  queue-family (:queue-family queue)
+                  queue-handle (handle queue)
+                  builders (:cmd-builders exec)
+                  is-root? (identical? exec execution)
 
-        ;; Submit to queue
-        (check-result (VK10/vkQueueSubmit queue-handle submit-info fence-handle))
+                  ;; Borrow command buffers and record commands
+                  cmd-buffers (mapv (fn [builder]
+                                      (let [cb (borrow-command-buffer cmd-buffer-allocator queue-family)
+                                            cbh (handle cb)]
+                                        (doseq [{:keys [record-fn]} (:commands-to-record builder)]
+                                          (record-fn cbh))
+                                        cb))
+                                    builders)
+                  _ (vswap! all-cmd-buffers into cmd-buffers)
 
-        ;; Create Clojure future that waits on fence
-        (future
-          (try
-            ;; Wait for fence (blocking)
-            (let [fence-buf (doto (.mallocLong (MemoryStack/stackPush) 1)
-                              (.put 0 fence-handle)
+                  wait-sems (.get wait-sems-for exec)
+                  signal-sems (.get signal-sems-for exec)]
+
+              (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+                (let [;; Create fence for root node only
+                      fence (when is-root?
+                              (let [fence-info (-> (VkFenceCreateInfo/calloc stack)
+                                                   (.sType$Default)
+                                                   (.flags 0))
+                                    fence-ptr (.mallocLong stack 1)]
+                                (check-result (VK10/vkCreateFence device-handle fence-info nil fence-ptr))
+                                (let [f (.get fence-ptr 0)]
+                                  (vreset! fence-handle f)
+                                  f)))
+
+                      ;; Command buffer handles
+                      cmd-buffer-ptrs (.mallocPointer stack (count cmd-buffers))
+                      _ (doseq [[i cb] (map-indexed vector cmd-buffers)]
+                          (.put cmd-buffer-ptrs i (handle cb)))
+                      _ (.flip cmd-buffer-ptrs)
+
+                      ;; Wait semaphores
+                      wait-sem-buf (when (seq wait-sems)
+                                     (let [buf (.mallocLong stack (count wait-sems))]
+                                       (doseq [[i sem] (map-indexed vector wait-sems)]
+                                         (.put buf i sem))
+                                       (.flip buf)))
+
+                      wait-stages (when (seq wait-sems)
+                                    (let [buf (.mallocInt stack (count wait-sems))]
+                                      (dotimes [i (count wait-sems)]
+                                        (.put buf i VK10/VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
+                                      (.flip buf)))
+
+                      ;; Signal semaphores
+                      signal-sem-buf (when (seq signal-sems)
+                                       (let [buf (.mallocLong stack (count signal-sems))]
+                                         (doseq [[i sem] (map-indexed vector signal-sems)]
+                                           (.put buf i sem))
+                                         (.flip buf)))
+
+                      ;; Build VkSubmitInfo
+                      submit-info (-> (VkSubmitInfo/calloc stack)
+                                      (.sType$Default)
+                                      (.pCommandBuffers cmd-buffer-ptrs))]
+
+                  (when wait-sem-buf
+                    (-> submit-info
+                        (.waitSemaphoreCount (count wait-sems))
+                        (.pWaitSemaphores wait-sem-buf)
+                        (.pWaitDstStageMask wait-stages)))
+
+                  (when signal-sem-buf
+                    (.pSignalSemaphores submit-info signal-sem-buf))
+
+                  ;; Submit with per-queue locking for thread safety
+                  (locking queue
+                    (check-result (VK10/vkQueueSubmit
+                                   queue-handle submit-info
+                                   (if fence fence VK10/VK_NULL_HANDLE))))
+
+                  (vswap! submitted-queues conj queue)))))
+
+          ;; Wait for root fence (guarantees all dependent work is also complete)
+          (with-open [^MemoryStack stack (MemoryStack/stackPush)]
+            (let [fence-buf (doto (.mallocLong stack 1)
+                              (.put 0 @fence-handle)
                               (.flip))]
-              (check-result (VK10/vkWaitForFences device-handle fence-buf true Long/MAX_VALUE)))
+              (check-result (VK10/vkWaitForFences device-handle fence-buf true Long/MAX_VALUE))))
 
-            ;; Cleanup
-            (cleanup-fn)
+          ;; Cleanup and success callback
+          (cleanup-sync)
+          (cleanup-cmd-buffers)
+          (when on-success (on-success))
 
-            ;; Call success callback if provided
-            (when on-success
-              (on-success))
+          (catch Exception e
+            ;; Wait for any in-flight GPU work before propagating
+            (wait-for-queues)
 
-            (catch Exception e
-              ;; Cleanup on error
-              (cleanup-fn)
-
-              ;; Call error callback if provided (swallows exception)
-              (if on-error
-                (on-error e)
-                ;; Re-throw only if no error callback
-                (throw e)))))))))
+            (if on-error
+              (on-error e)
+              (throw e))))))))

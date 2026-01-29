@@ -131,6 +131,10 @@ The basic VMA allocator is implemented and automatically created with logical de
 - Budget tracking: Adaptive quality settings, preventing out-of-memory crashes
 - Defragmentation: Long-running applications, dynamic worlds with frequent allocation/deallocation
 
+### Better Support for Transient Command Pools
+
+Allow the command buffer allocator to efficiently handle short-lived (transient) command buffers alongside long-lived pooled ones.
+
 ### Extension-Specific Device Properties
 
 Currently, `properties` only returns core `VkPhysicalDeviceProperties` fields (9 fields). Vulkan exposes ~500+ additional properties through extensions (ray tracing, mesh shaders, fragment shading rate, etc.).
