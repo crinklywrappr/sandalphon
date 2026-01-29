@@ -11,7 +11,7 @@
            [org.lwjgl.vulkan VK VkApplicationInfo VkInstanceCreateInfo VkInstance
             VkPhysicalDevice VkPhysicalDeviceProperties VkPhysicalDeviceFeatures
             VkLayerProperties VkExtensionProperties VkPhysicalDeviceGroupProperties
-            VkQueueFamilyProperties VkDebugUtilsMessengerCallbackEXT
+            VkQueueFamilyProperties VkDebugUtilsMessengerCallbackEXT VkCommandBuffer
             VkDebugUtilsMessengerCallbackDataEXT VkDebugUtilsMessengerCreateInfoEXT
             VkDeviceCreateInfo VkDeviceQueueCreateInfo VkDevice VkDeviceGroupDeviceCreateInfo
             VkQueue VkBufferCreateInfo VkCommandPoolCreateInfo VkCommandBufferAllocateInfo
@@ -1480,6 +1480,7 @@
   [buffer]
   (host-has-access? buffer))
 
+;; TODO: how to initialize with data, even if the allocation flags don't allow writing
 (defn memory-buffer!
   "Creates a Vulkan buffer with automatic memory allocation via VMA.
 
@@ -2076,7 +2077,7 @@
           pool-handle (handle command-pool)
           cmd-buffer-handle (handle this)]
       (with-open [^MemoryStack stack (MemoryStack/stackPush)]
-        (let [buffer-ptr (doto (.mallocPointer stack 1) (.put 0 cmd-buffer-handle) (.flip))]
+        (let [buffer-ptr (doto (.mallocPointer stack 1) (.put cmd-buffer-handle) (.flip))]
           (VK10/vkFreeCommandBuffers (handle device) pool-handle buffer-ptr)))))
 
   IVulkanHandle
@@ -2162,7 +2163,7 @@
        ;; Convert to CommandBuffer records
        (vec
         (for [i (range n)]
-          (let [cmd-buffer-handle (.get cmd-buffer-ptrs i)]
+          (let [cmd-buffer-handle (VkCommandBuffer. (.get cmd-buffer-ptrs i) device-handle)]
             (with-meta (->CommandBuffer command-pool level [])
               {:handle cmd-buffer-handle}))))))))
 
@@ -2192,8 +2193,7 @@
   attached so that `return` can restore it later."
   [pool k]
   (let [mybox (.borrowObject pool k)]
-    (with-meta @mybox
-      {:box mybox :pool pool :key k})))
+    (vary-meta @mybox assoc :box mybox :pool pool :key k)))
 
 (defn- return
   "Returns a value to the pool it was borrowed from. Uses the {:box, :pool, :key}
@@ -2588,7 +2588,7 @@
     - wait-for for adding dependencies
     - then-execute for chaining executions"
   [cmd-builder queue]
-  (->Execution [cmd-builder] queue [] {}))
+  (->Execution [cmd-builder] queue []))
 
 (defn wait-for
   "Adds dependencies to an execution.
@@ -2653,11 +2653,26 @@
     @result))
 
 (defn submit!
-  "Submits an execution tree to the GPU.
+  "Submits an execution tree to the GPU asynchronously.
 
-  Walks the execution dependency tree, topologically sorts the nodes, and
-  submits each to its queue with semaphore-based synchronization. Command
-  buffers are borrowed from the allocator, recorded, submitted, and
+  Walks the execution tree in dependency order, borrowing command buffers
+  for each node and recording commands. Creates binary semaphores to chain
+  dependencies (one per edge in the DAG). Uses a single fence on the root
+  node; waiting for this fence guarantees all dependent work is complete.
+
+  Command buffers are borrowed from the allocator and recorded/returned
+  automatically. The borrow operation uses the calling thread's ID, so all
+  command pool operations happen on the future's thread for thread safety.
+
+  Returns immediately with a future. Deref the future to block until GPU
+  completes. The future handles cleanup of semaphores, fence, and command
+  buffers on both success and error paths.
+
+  On success, returns the result of :on-success callback (or nil if not provided).
+  On error with :on-error, returns the result of :on-error callback (exception is swallowed).
+  On error without :on-error, throws the exception when the future is deref'd.
+
+  The allocator typically comes from command-buffer-allocator!. Command buffers are
   automatically returned after GPU completion.
 
   All command pool operations (borrow, record, return) execute on the future's
@@ -2706,7 +2721,7 @@
     - execute for creating executions
     - wait-for for adding dependencies
     - then-execute for chaining executions"
-  [cmd-buffer-allocator execution & {:keys [on-success on-error]}]
+  [execution cmd-buffer-allocator & {:keys [on-success on-error]}]
   (let [sorted (topological-sort-executions execution)]
     (future
       (let [device (-> execution :queue :logical-device)
@@ -2805,30 +2820,30 @@
                                   (vreset! fence-handle f)
                                   f)))
 
-                      ;; Command buffer handles
-                      cmd-buffer-ptrs (.mallocPointer stack (count cmd-buffers))
-                      _ (doseq [[i cb] (map-indexed vector cmd-buffers)]
-                          (.put cmd-buffer-ptrs i (handle cb)))
-                      _ (.flip cmd-buffer-ptrs)
+                      ;; Command buffer handles - use sequential put then flip
+                      cmd-buffer-ptrs (let [buf (.mallocPointer stack (count cmd-buffers))]
+                                        (doseq [cb cmd-buffers]
+                                          (.put buf (handle cb)))
+                                        (.flip buf))
 
-                      ;; Wait semaphores
+                      ;; Wait semaphores - use sequential put then flip
                       wait-sem-buf (when (seq wait-sems)
                                      (let [buf (.mallocLong stack (count wait-sems))]
-                                       (doseq [[i sem] (map-indexed vector wait-sems)]
-                                         (.put buf i sem))
+                                       (doseq [sem wait-sems]
+                                         (.put buf sem))
                                        (.flip buf)))
 
                       wait-stages (when (seq wait-sems)
                                     (let [buf (.mallocInt stack (count wait-sems))]
-                                      (dotimes [i (count wait-sems)]
-                                        (.put buf i VK10/VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
+                                      (dotimes [_ (count wait-sems)]
+                                        (.put buf VK10/VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
                                       (.flip buf)))
 
-                      ;; Signal semaphores
+                      ;; Signal semaphores - use sequential put then flip
                       signal-sem-buf (when (seq signal-sems)
                                        (let [buf (.mallocLong stack (count signal-sems))]
-                                         (doseq [[i sem] (map-indexed vector signal-sems)]
-                                           (.put buf i sem))
+                                         (doseq [sem signal-sems]
+                                           (.put buf sem))
                                          (.flip buf)))
 
                       ;; Build VkSubmitInfo
