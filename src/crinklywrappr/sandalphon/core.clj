@@ -25,6 +25,8 @@
            [java.nio ByteBuffer]
            [java.util.concurrent.atomic AtomicLong]))
 
+;; TODO: all of the defs that use reflection could be wrapped in `(delay ...)`
+
 ;; ============================================================================
 ;; Error Handling
 ;; ============================================================================
@@ -2171,6 +2173,7 @@
 ;; Command Buffer Factory (Apache Commons Pool Integration)
 ;; ============================================================================
 
+;; TODO: can the box be replaced with atom/volatile? (tried atom - didn't work.)
 (defprotocol IBox
   "Mutable container protocol for use with Apache Commons Pool.
   Pool objects must be mutable so their contents can be swapped between
@@ -2637,6 +2640,7 @@
   (-> (execute cmd-builder queue)
       (wait-for prev-execution)))
 
+;; TODO: make non-recursive (e.g. zipper/walker)
 (defn- topological-sort-executions
   "Returns executions in dependency-first order via post-order DFS.
   Uses object identity to handle duplicate references in the DAG."

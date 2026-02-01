@@ -210,6 +210,47 @@ Surface support is required for rendering graphics to a window. The following fu
 
 **Current Status:** Not yet implemented. Requires surface creation from windowing system integration.
 
+
+### Compile-Time Shader Compilation
+
+A macro-based shader compilation system that compiles GLSL to SPIR-V at macro-expansion time, similar to Rust/vulkano's `shader!` procedural macro.
+
+**Current Status:** Phase 1 complete. See [SHADER_COMPILATION.md](SHADER_COMPILATION.md) for detailed design.
+
+**API:**
+```clojure
+(require '[crinklywrappr.sandalphon.shader :refer [defshader]])
+
+(defshader my-compute
+  :stage :compute
+  :source "
+    #version 450
+    layout(local_size_x = 64) in;
+    layout(set = 0, binding = 0) buffer Data { uint data[]; };
+    void main() { data[gl_GlobalInvocationID.x] *= 12; }
+  ")
+
+;; my-compute is now a map with :spirv ByteBuffer, :stage, :name, :source-hash
+```
+
+**Features (Phase 1 - Complete):**
+- Compile GLSL to SPIR-V at macro-expansion time using shaderc (via LWJGL)
+- Embed SPIR-V bytes directly in compiled .class files (with AOT)
+- Support inline source, file paths, and classpath resources
+- Configurable optimization level and target Vulkan version
+- Immediate compilation errors during development (not runtime failures)
+
+**Phases:**
+1. ✅ Basic macro - Compile and embed SPIR-V bytes
+2. Reflection - Parse bindings using lwjgl-spvc (SPIRV-Cross)
+3. Auto-layout - Generate descriptor/pipeline layouts automatically
+4. Caching - Cache compiled SPIR-V for faster incremental builds
+5. Hot reload - Watch shader files and recompile during development
+
+**Dependencies:**
+- `glslc` from Vulkan SDK (required)
+- `lwjgl-spvc` for SPIRV-Cross reflection (optional)
+
 ## License
 
 Copyright © 2026 Crinklywrappr
