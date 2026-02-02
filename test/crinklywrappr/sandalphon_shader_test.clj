@@ -240,7 +240,8 @@ void main() {}")
     (is (contains? test-compute-shader :name))
     (is (contains? test-compute-shader :stage))
     (is (contains? test-compute-shader :spirv))
-    (is (contains? test-compute-shader :source-hash))))
+    (is (contains? test-compute-shader :source-hash))
+    (is (contains? test-compute-shader :bindings))))
 
 (deftest defshader-name-test
   (testing "defshader :name is the symbol name"
@@ -261,6 +262,10 @@ void main() {}")
     (is (string? (:source-hash test-compute-shader)))
     (is (= 64 (count (:source-hash test-compute-shader)))) ; SHA-256 = 64 hex chars
     (is (re-matches #"[0-9a-f]+" (:source-hash test-compute-shader)))))
+
+(deftest defshader-omits-nil-values-test
+  (testing "defshader omits :push-constants when none present"
+    (is (not (contains? test-compute-shader :push-constants)))))
 
 (shader/defshader test-optimized-shader
   :stage :compute
@@ -341,3 +346,159 @@ void main() {}"
   (testing "Different source produces different hash"
     (is (not= (:source-hash hash-test-shader-1)
               (:source-hash hash-test-shader-different)))))
+
+;; ============================================================================
+;; Reflection Tests (Phase 2)
+;; ============================================================================
+
+(def ^:private reflection-test-shader-source
+  "#version 450
+
+layout(local_size_x = 64, local_size_y = 4, local_size_z = 2) in;
+
+layout(push_constant) uniform PushConstants {
+    uint offset;
+    float scale;
+} pc;
+
+layout(set = 0, binding = 0) uniform Params {
+    mat4 transform;
+} params;
+
+layout(set = 0, binding = 1) buffer DataIn {
+    float data[];
+} input_buf;
+
+layout(set = 1, binding = 0) buffer DataOut {
+    float data[];
+} output_buf;
+
+layout(set = 1, binding = 1) uniform sampler2D tex;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x + pc.offset;
+    output_buf.data[idx] = input_buf.data[idx] * pc.scale;
+}")
+
+(deftest reflect-spirv-bindings-test
+  (testing "reflect-spirv extracts descriptor bindings"
+    (let [spirv (shader/compile-glsl reflection-test-shader-source :compute)
+          reflection (shader/reflect-spirv spirv)]
+      (is (vector? (:bindings reflection)))
+      (is (= 4 (count (:bindings reflection))) "Should have 4 bindings")
+      
+      ;; Check each binding
+      (let [bindings (:bindings reflection)
+            by-set-binding (group-by (juxt :set :binding) bindings)]
+        ;; set 0, binding 0 - uniform buffer
+        (is (= :uniform-buffer (:type (first (get by-set-binding [0 0])))))
+        ;; set 0, binding 1 - storage buffer
+        (is (= :storage-buffer (:type (first (get by-set-binding [0 1])))))
+        ;; set 1, binding 0 - storage buffer
+        (is (= :storage-buffer (:type (first (get by-set-binding [1 0])))))
+        ;; set 1, binding 1 - sampled image
+        (is (= :sampled-image (:type (first (get by-set-binding [1 1])))))))))
+
+(deftest reflect-spirv-binding-details-test
+  (testing "reflect-spirv extracts binding type details"
+    (let [spirv (shader/compile-glsl reflection-test-shader-source :compute)
+          reflection (shader/reflect-spirv spirv)
+          params-binding (first (filter #(= "params" (:name %)) (:bindings reflection)))]
+      (is (= :struct (:basetype params-binding)))
+      (is (number? (:block-size params-binding)))
+      (is (vector? (:members params-binding)))
+      (is (= 1 (count (:members params-binding))))
+      
+      ;; Check mat4 member
+      (let [transform-member (first (:members params-binding))]
+        (is (= "transform" (:name transform-member)))
+        (is (= :fp-32 (:basetype transform-member)))
+        (is (= 4 (:vector-size transform-member)))
+        (is (= 4 (:columns transform-member)))
+        (is (= 0 (:offset transform-member)))
+        (is (= 64 (:size transform-member)))))))
+
+(deftest reflect-spirv-push-constants-test
+  (testing "reflect-spirv extracts push constants with full details"
+    (let [spirv (shader/compile-glsl reflection-test-shader-source :compute)
+          reflection (shader/reflect-spirv spirv)]
+      (is (vector? (:push-constants reflection)))
+      (is (= 1 (count (:push-constants reflection))))
+      
+      (let [pc (first (:push-constants reflection))]
+        (is (= "pc" (:name pc)))
+        (is (= :struct (:basetype pc)))
+        (is (number? (:block-size pc)))
+        (is (vector? (:members pc)))
+        (is (= 2 (count (:members pc))))
+        
+        ;; Check members
+        (let [[offset-member scale-member] (:members pc)]
+          (is (= "offset" (:name offset-member)))
+          (is (= :uint-32 (:basetype offset-member)))
+          (is (= "scale" (:name scale-member)))
+          (is (= :fp-32 (:basetype scale-member))))))))
+
+(deftest reflect-spirv-local-size-test
+  (testing "reflect-spirv extracts local size for compute shaders"
+    (let [spirv (shader/compile-glsl reflection-test-shader-source :compute)
+          reflection (shader/reflect-spirv spirv)]
+      (is (= [64 4 2] (:local-size reflection))))))
+
+(deftest reflect-spirv-no-local-size-for-vertex-test
+  (testing "reflect-spirv omits local-size for non-compute shaders"
+    (let [spirv (shader/compile-glsl simple-vertex-shader :vertex)
+          reflection (shader/reflect-spirv spirv)]
+      (is (not (contains? reflection :local-size))))))
+
+(deftest reflect-spirv-no-push-constants-test
+  (testing "reflect-spirv omits push-constants when none present"
+    (let [spirv (shader/compile-glsl simple-compute-shader :compute)
+          reflection (shader/reflect-spirv spirv)]
+      (is (not (contains? reflection :push-constants))))))
+
+(shader/defshader reflection-test-compute
+  :stage :compute
+  :source "#version 450
+layout(local_size_x = 32, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Data { uint data[]; } buf;
+layout(set = 0, binding = 1) uniform sampler2D tex;
+void main() { buf.data[gl_GlobalInvocationID.x] *= 2; }")
+
+(deftest defshader-includes-bindings-test
+  (testing "defshader includes bindings in output"
+    (is (vector? (:bindings reflection-test-compute)))
+    (is (= 2 (count (:bindings reflection-test-compute))))
+    (let [storage-binding (first (filter #(= :storage-buffer (:type %)) 
+                                         (:bindings reflection-test-compute)))]
+      (is (= 0 (:set storage-binding)))
+      (is (= 0 (:binding storage-binding)))
+      (is (= :struct (:basetype storage-binding))))))
+
+(deftest defshader-includes-local-size-test
+  (testing "defshader includes local-size in output"
+    (is (= [32 8 1] (:local-size reflection-test-compute)))))
+
+(shader/defshader reflection-test-with-push-constants
+  :stage :compute
+  :source "#version 450
+layout(local_size_x = 64) in;
+layout(push_constant) uniform PC { uint count; float scale; } pc;
+layout(set = 0, binding = 0) buffer Data { float data[]; } buf;
+void main() { buf.data[gl_GlobalInvocationID.x] *= pc.scale; }")
+
+(deftest defshader-includes-push-constants-test
+  (testing "defshader includes push-constants when present"
+    (is (contains? reflection-test-with-push-constants :push-constants))
+    (is (vector? (:push-constants reflection-test-with-push-constants)))
+    (let [pc (first (:push-constants reflection-test-with-push-constants))]
+      (is (= "pc" (:name pc)))
+      (is (number? (:block-size pc)))
+      (is (= 2 (count (:members pc)))))))
+
+(deftest load-spirv-includes-reflection-test
+  (testing "load-spirv includes reflection data"
+    (let [f (create-temp-spirv-file)
+          result (shader/load-spirv f :compute)]
+      (is (contains? result :bindings))
+      (is (vector? (:bindings result))))))

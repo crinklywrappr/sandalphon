@@ -4,7 +4,10 @@ This document outlines a macro-based shader compilation system for Sandalphon th
 
 ## Current Status
 
-**Phase 1 is complete.** The `defshader` macro compiles GLSL to SPIR-V at macro-expansion time using shaderc (via LWJGL bindings). With AOT compilation, shaders are compiled once at build time and embedded in .class files.
+**Phase 1 and Phase 2 are complete.**
+
+- Phase 1: `defshader` macro compiles GLSL to SPIR-V at macro-expansion time using shaderc
+- Phase 2: SPIR-V reflection extracts descriptor bindings, push constants, and local size
 
 ## Overview
 
@@ -53,7 +56,12 @@ The macro expands to a def containing:
   {:name        "multiply-compute"
    :stage       :compute
    :spirv       #<ByteBuffer ...>   ;; SPIR-V bytecode (native byte order)
-   :source-hash "abc123..."})       ;; SHA-256 for cache invalidation
+   :source-hash "abc123..."         ;; SHA-256 for cache invalidation
+   
+   ;; Reflection data (Phase 2)
+   :bindings    [{:set 0, :binding 0, :type :storage-buffer, :name "buf"}]
+   :push-constants nil              ;; Vector of {:name "..."} if present
+   :local-size  [64 1 1]})          ;; Compute workgroup size
 ```
 
 ### File-based Shaders
@@ -81,13 +89,64 @@ For shaders in separate files (classpath resources or filesystem):
 (target-environments)    ;; => #{:vulkan-1.0 :vulkan-1.1 ...}
 ```
 
+### Standalone Reflection
+
+You can also reflect on SPIR-V bytecode directly:
+
+```clojure
+(let [spirv (compile-glsl source :compute)]
+  (reflect-spirv spirv))
+;; => {:bindings [...], :push-constants [...], :local-size [64 1 1]}
+```
+
 ### Loading Pre-compiled SPIR-V
 
 For shaders compiled externally:
 
 ```clojure
 (load-spirv "path/to/shader.spv" :compute)
-;; => {:name "path/to/shader.spv" :stage :compute :spirv #<ByteBuffer>}
+;; => {:name "path/to/shader.spv" 
+;;     :stage :compute 
+;;     :spirv #<ByteBuffer>
+;;     :bindings [...]
+;;     :push-constants nil
+;;     :local-size [64 1 1]}
+```
+
+## Reflection Data
+
+### Binding Types
+
+The `:type` field in bindings can be:
+
+| Type | Description |
+|------|-------------|
+| `:uniform-buffer` | Uniform buffer (UBO) |
+| `:storage-buffer` | Storage buffer (SSBO) |
+| `:sampled-image` | Combined image sampler |
+| `:storage-image` | Storage image (read/write) |
+| `:separate-image` | Texture without sampler |
+| `:sampler` | Standalone sampler |
+| `:subpass-input` | Subpass input attachment |
+| `:acceleration-structure` | Ray tracing acceleration structure |
+
+### Example Reflection Output
+
+For a shader with:
+```glsl
+layout(set = 0, binding = 0) uniform Params { mat4 mvp; } params;
+layout(set = 0, binding = 1) buffer Input { float data[]; } input_buf;
+layout(set = 1, binding = 0) uniform sampler2D tex;
+layout(push_constant) uniform Constants { uint count; } pc;
+```
+
+The reflection produces:
+```clojure
+{:bindings [{:set 0, :binding 0, :type :uniform-buffer, :name "params"}
+            {:set 0, :binding 1, :type :storage-buffer, :name "input_buf"}
+            {:set 1, :binding 0, :type :sampled-image, :name "tex"}]
+ :push-constants [{:name "pc"}]
+ :local-size nil}  ;; nil for non-compute shaders
 ```
 
 ## Implementation
@@ -114,14 +173,14 @@ For shaders compiled externally:
          │
          ▼
 ┌─────────────────┐
-│ Convert to byte │
-│ vector for emit │
+│ Reflect via     │
+│ spvc (LWJGL)    │
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
 │ Emit def with   │
-│ ByteBuffer init │
+│ bytes + metadata│
 └─────────────────┘
 ```
 
@@ -150,46 +209,9 @@ The `Compilable` protocol (similar to `clojure.java.io/Coercions`) handles sourc
 - Strings without newlines try: classpath resource → filesystem → inline fallback
 - Files, URLs, and Paths are read directly
 
-## SPIR-V Reflection (Phase 2 - Future)
-
-### Option 1: LWJGL SPIRV-Cross (Recommended)
-
-LWJGL includes bindings to SPIRV-Cross via `lwjgl-spvc`:
-
-```clojure
-;; deps.edn
-{org.lwjgl/lwjgl-spvc {:mvn/version "3.3.6"}
- org.lwjgl/lwjgl-spvc$natives-linux {:mvn/version "3.3.6"}}
-```
-
-SPIRV-Cross can:
-- Extract descriptor bindings (uniforms, storage buffers, samplers)
-- Extract push constant ranges
-- Extract input/output variables
-- Extract compute local sizes
-- Cross-compile to other shading languages
-
-### Option 2: Manual SPIR-V Parsing
-
-SPIR-V is a well-documented binary format. Key opcodes for reflection:
-
-| Opcode | Purpose |
-|--------|---------|
-| `OpDecorate` | Binding, set, location decorations |
-| `OpMemberDecorate` | Struct member decorations |
-| `OpVariable` | Variable declarations |
-| `OpTypeStruct` | Struct type definitions |
-| `OpExecutionMode` | Compute local size |
-
-The format is straightforward:
-- Little-endian 32-bit words
-- Magic number: `0x07230203`
-- Header: version, generator, bound, schema
-- Instructions: opcode + word count in first word, then operands
-
 ## Integration with Pipeline Creation (Phase 3 - Future)
 
-The shader metadata will enable automatic pipeline layout creation:
+The reflection data will enable automatic pipeline layout creation:
 
 ```clojure
 (defn create-compute-pipeline [device shader]
@@ -230,19 +252,17 @@ This gives immediate feedback during development, just like Rust.
 
 ## Dependencies
 
-### Required (Phase 1 - Complete)
+### Required (Phase 1 & 2 - Complete)
 
 Already included in Sandalphon:
 
 ```clojure
 ;; deps.edn
 {org.lwjgl/lwjgl-shaderc {:mvn/version "3.3.6"}
- org.lwjgl/lwjgl-shaderc$natives-linux {:mvn/version "3.3.6"}}
+ org.lwjgl/lwjgl-shaderc$natives-linux {:mvn/version "3.3.6"}
+ org.lwjgl/lwjgl-spvc {:mvn/version "3.3.6"}
+ org.lwjgl/lwjgl-spvc$natives-linux {:mvn/version "3.3.6"}}
 ```
-
-### Optional (Future Phases)
-
-- `lwjgl-spvc` - For SPIR-V reflection via SPIRV-Cross (Phase 2)
 
 ## Roadmap
 
@@ -253,13 +273,15 @@ Already included in Sandalphon:
    - Configurable optimization level and target environment
    - Comprehensive test coverage
 
-2. **Phase 2: Reflection** - Parse SPIR-V for bindings using lwjgl-spvc
-   - Extract descriptor bindings (set, binding, type)
-   - Extract push constant ranges
+2. **Phase 2: Reflection** - ✅ Complete
+   - Extract descriptor bindings (set, binding, type, name)
+   - Extract push constant info
    - Extract compute local workgroup size
+   - `reflect-spirv` function for standalone reflection
+   - Reflection data included in `defshader` and `load-spirv` output
 
 3. **Phase 3: Auto-layout** - Generate descriptor/pipeline layouts from reflection
-   - Auto-create descriptor set layouts
+   - Auto-create descriptor set layouts from bindings
    - Auto-create pipeline layouts
    - Reduce boilerplate for common patterns
 
@@ -277,3 +299,4 @@ Already included in Sandalphon:
 - [SPIRV-Cross](https://github.com/KhronosGroup/SPIRV-Cross)
 - [shaderc](https://github.com/google/shaderc)
 - [Vulkano shader macro](https://github.com/vulkano-rs/vulkano/tree/master/vulkano-shaders)
+- [LWJGL SPVC Javadoc](https://javadoc.lwjgl.org/org/lwjgl/util/spvc/Spvc.html)

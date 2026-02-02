@@ -96,7 +96,7 @@ Vulkan resources (command buffers, buffers, images, etc.) wrap native handles th
 - Safer pool implementations (can validate handles are not freed)
 - Better debugging experience (no mysterious segfaults)
 
-**Current Status:** Not yet implemented. Resources can be used after being freed with no protection.
+****Current Status:*** Not yet implemented. Resources can be used after being freed with no protection.
 
 ### Device Limits and Sparse Properties
 
@@ -117,7 +117,7 @@ See [CONCEPTS.md](CONCEPTS.md) for detailed explanations of device limits and sp
 
 The basic VMA allocator is implemented and automatically created with logical devices. Advanced features for specialized use cases remain to be implemented.
 
-**Current Status:** Basic allocator with default Best-Fit algorithm implemented
+****Current Status:*** Basic allocator with default Best-Fit algorithm implemented
 
 **Planned:**
 - **Custom Memory Pools** - Create dedicated pools with custom allocation strategies (linear allocator for free-at-once patterns, stack/LIFO, ring-buffer/FIFO)
@@ -139,7 +139,7 @@ Allow the command buffer allocator to efficiently handle short-lived (transient)
 
 Currently, `properties` only returns core `VkPhysicalDeviceProperties` fields (9 fields). Vulkan exposes ~500+ additional properties through extensions (ray tracing, mesh shaders, fragment shading rate, etc.).
 
-**Current Status:** Only core properties implemented
+****Current Status:*** Only core properties implemented
 
 **Planned:**
 - Implement `vkGetPhysicalDeviceProperties2` with pNext chain support
@@ -151,7 +151,7 @@ Currently, `properties` only returns core `VkPhysicalDeviceProperties` fields (9
 
 Currently, `supported-features` only returns core `VkPhysicalDeviceFeatures` fields (55 boolean features). Vulkan exposes ~355+ additional features through extensions that must be queried and enabled separately.
 
-**Current Status:** Only core features implemented (e.g., `:geometry-shader`, `:tessellation-shader`, `:multi-draw-indirect`)
+****Current Status:*** Only core features implemented (e.g., `:geometry-shader`, `:tessellation-shader`, `:multi-draw-indirect`)
 
 **Planned:**
 - Implement `vkGetPhysicalDeviceFeatures2` with pNext chain support
@@ -164,7 +164,7 @@ Currently, `supported-features` only returns core `VkPhysicalDeviceFeatures` fie
 
 Currently, queue creation hardcodes `.flags 0` (no flags). Vulkan supports `VkDeviceQueueCreateFlags` for specialized queue creation.
 
-**Current Status:** Not yet implemented
+****Current Status:*** Not yet implemented
 
 **Available Flags:**
 - `VK_DEVICE_QUEUE_CREATE_PROTECTED_BIT` - Create queues that can only access protected memory (for DRM/secure content)
@@ -195,7 +195,7 @@ To support macOS, the following must be implemented:
 
 Without these portability extensions, instance creation will fail on macOS or will not enumerate MoltenVK devices.
 
-**Current Status:** Not yet implemented. Extension and layer support needs to be added to `create-instance` first.
+****Current Status:*** Not yet implemented. Extension and layer support needs to be added to `create-instance` first.
 
 ### Surface Support (Graphics Rendering)
 
@@ -208,14 +208,14 @@ Surface support is required for rendering graphics to a window. The following fu
 
 **Note:** Surface support is not needed for headless compute workloads or offscreen rendering.
 
-**Current Status:** Not yet implemented. Requires surface creation from windowing system integration.
+****Current Status:*** Not yet implemented. Requires surface creation from windowing system integration.
 
 
 ### Compile-Time Shader Compilation
 
 A macro-based shader compilation system that compiles GLSL to SPIR-V at macro-expansion time, similar to Rust/vulkano's `shader!` procedural macro.
 
-**Current Status:** Phase 1 complete. See [SHADER_COMPILATION.md](SHADER_COMPILATION.md) for detailed design.
+**Current Status:** Phase 1 & 2 complete. See [SHADER_COMPILATION.md](SHADER_COMPILATION.md) for detailed design.
 
 **API:**
 ```clojure
@@ -233,19 +233,24 @@ A macro-based shader compilation system that compiles GLSL to SPIR-V at macro-ex
 ;; my-compute is now a map with :spirv ByteBuffer, :stage, :name, :source-hash
 ```
 
-**Features (Phase 1 - Complete):**
+**Features (Phase 1 & 2 - Complete):**
 - Compile GLSL to SPIR-V at macro-expansion time using shaderc (via LWJGL)
 - Embed SPIR-V bytes directly in compiled .class files (with AOT)
 - Support inline source, file paths, and classpath resources
 - Configurable optimization level and target Vulkan version
 - Immediate compilation errors during development (not runtime failures)
+- SPIR-V reflection extracts descriptor bindings, push constants, and local size
 
 **Phases:**
 1. ✅ Basic macro - Compile and embed SPIR-V bytes
-2. Reflection - Parse bindings using lwjgl-spvc (SPIRV-Cross)
+2. ✅ Reflection - Extract bindings, push constants, local size
 3. Auto-layout - Generate descriptor/pipeline layouts automatically
 4. Caching - Cache compiled SPIR-V for faster incremental builds
 5. Hot reload - Watch shader files and recompile during development
+
+
+
+
 
 **Dependencies:**
 - `glslc` from Vulkan SDK (required)
