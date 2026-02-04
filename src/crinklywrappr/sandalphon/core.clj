@@ -16,7 +16,7 @@
             VkDeviceCreateInfo VkDeviceQueueCreateInfo VkDevice VkDeviceGroupDeviceCreateInfo
             VkQueue VkBufferCreateInfo VkCommandPoolCreateInfo VkCommandBufferAllocateInfo
             VkCommandBufferBeginInfo VkSubmitInfo VkSemaphoreCreateInfo VkFenceCreateInfo
-            EXTDebugUtils VK10 VK11 KHRVideoDecodeQueue KHRVideoEncodeQueue NVOpticalFlow]
+            EXTDebugUtils VK10 VK11 VK12 KHRVideoDecodeQueue KHRVideoEncodeQueue NVOpticalFlow]
            [org.lwjgl.util.vma Vma VmaAllocatorCreateInfo VmaAllocationCreateInfo VmaVulkanFunctions]
            [org.apache.commons.pool2 KeyedPooledObjectFactory]
            [org.apache.commons.pool2.impl DefaultPooledObject GenericKeyedObjectPool
@@ -2891,3 +2891,108 @@
             (if on-error
               (on-error e)
               (throw e))))))))
+
+;; ============================================================================
+;; Descriptor Set Layouts
+;; ============================================================================
+
+(def ^:private descriptor-type->int
+  "Map of descriptor type keywords to VK10 integer constants.
+   Discovered via reflection at load time."
+  (delay
+    (into {}
+          (comp
+           (map (comp str :name))
+           (filter #(sg/starts-with? % "VK_DESCRIPTOR_TYPE_"))
+           (keep (fn [s]
+                   (when-let [v (.get (.getField VK10 s) nil)]
+                     [(-> (sg/replace s "VK_DESCRIPTOR_TYPE_" "")
+                          csk/->kebab-case-keyword)
+                      v]))))
+          (:members (reflect/type-reflect VK10)))))
+
+(def ^:private int->descriptor-type
+  "Reverse mapping: VK10 integer constants to descriptor type keywords."
+  (delay (st/map-invert @descriptor-type->int)))
+
+(def ^:private stage->int
+  "Map of shader stage keywords to VK10 bit constants.
+   Discovered via reflection at load time."
+  (delay
+    (into {}
+          (comp
+           (map (comp str :name))
+           (filter #(sg/starts-with? % "VK_SHADER_STAGE_"))
+           (filter #(sg/ends-with? % "_BIT"))
+           (keep (fn [s]
+                   (when-let [v (.get (.getField VK10 s) nil)]
+                     [(-> (sg/replace s "VK_SHADER_STAGE_" "")
+                          (sg/replace "_BIT" "")
+                          csk/->kebab-case-keyword)
+                      v]))))
+          (:members (reflect/type-reflect VK10)))))
+
+(def ^:private int->stage
+  "Reverse mapping: VK10 bit constants to shader stage keywords."
+  (delay (st/map-invert @stage->int)))
+
+(defn descriptor-types
+  "Returns the set of supported descriptor type keywords.
+
+   Example types:
+     :uniform-buffer          - Small read-only data (matrices, parameters)
+     :storage-buffer          - Large or read-write data
+     :uniform-buffer-dynamic  - Uniform buffer with runtime offset
+     :storage-buffer-dynamic  - Storage buffer with runtime offset
+     :sampled-image           - Textures for sampling
+     :storage-image           - Images for compute read/write
+     :sampler                 - Separate sampler object
+     :combined-image-sampler  - Texture + sampler together
+     :input-attachment        - Framebuffer input for subpasses"
+  []
+  (set (keys @descriptor-type->int)))
+
+(defn shader-stages
+  "Returns the set of supported shader stage keywords.
+
+   Example stages:
+     :vertex                   - Vertex shader
+     :fragment                 - Fragment shader
+     :compute                  - Compute shader
+     :geometry                 - Geometry shader
+     :tessellation-control     - Tessellation control shader
+     :tessellation-evaluation  - Tessellation evaluation shader"
+  []
+  (set (keys @stage->int)))
+
+(def ^:private binding-flag->int
+  "Map of descriptor binding flag keywords to VK12 bit constants.
+   Discovered via reflection at load time."
+  (delay
+    (into {}
+          (comp
+           (map (comp str :name))
+           (filter #(sg/starts-with? % "VK_DESCRIPTOR_BINDING_"))
+           (filter #(sg/ends-with? % "_BIT"))
+           (keep (fn [s]
+                   (when-let [v (.get (.getField VK12 s) nil)]
+                     [(-> (sg/replace s "VK_DESCRIPTOR_BINDING_" "")
+                          (sg/replace "_BIT" "")
+                          csk/->kebab-case-keyword)
+                      v]))))
+          (:members (reflect/type-reflect VK12)))))
+
+(def ^:private int->binding-flag
+  "Reverse mapping: VK12 bit constants to descriptor binding flag keywords."
+  (delay (st/map-invert @binding-flag->int)))
+
+(defn binding-flags
+  "Returns the set of supported descriptor binding flag keywords.
+
+   Flags:
+     :update-after-bind             - Descriptors can be updated after binding to command buffer
+     :partially-bound               - Not all array elements need valid descriptors
+     :update-unused-while-pending   - Can update descriptors not used by pending commands
+     :variable-descriptor-count     - Final binding has runtime-determined array size"
+  []
+  (set (keys @binding-flag->int)))

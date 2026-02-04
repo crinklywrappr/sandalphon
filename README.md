@@ -256,6 +256,40 @@ A macro-based shader compilation system that compiles GLSL to SPIR-V at macro-ex
 - `glslc` from Vulkan SDK (required)
 - `lwjgl-spvc` for SPIRV-Cross reflection (optional)
 
+
+### Descriptor Set Layouts
+
+Descriptor set layouts define the shape of descriptor sets - which bindings exist, their types, stage visibility, and flags.
+
+**Current Status:** Reflection-based constant discovery complete. Layout creation not yet implemented.
+
+**API (planned):**
+```clojure
+(require '[crinklywrappr.sandalphon.core :as vk])
+
+;; Query available options
+(vk/descriptor-types)   ;; => #{:uniform-buffer :storage-buffer :sampled-image ...}
+(vk/shader-stages)      ;; => #{:vertex :fragment :compute ...}
+(vk/binding-flags)      ;; => #{:update-after-bind :partially-bound ...}
+
+;; Create layout from data
+(vk/descriptor-set-layout! device
+  {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex :fragment}}
+              {:binding 1 :type :sampled-image :stages #{:fragment} :count 4}]})
+```
+
+**Features:**
+- ✅ Descriptor type constants (via reflection)
+- ✅ Shader stage constants (via reflection)
+- ✅ Binding flag constants (via reflection)
+- Layout creation from Clojure data
+- Validation against shader reflection data
+- Push descriptors (`VK_KHR_push_descriptor` extension)
+
+**Documentation:**
+- [DESCRIPTOR_SET_LAYOUT_DESIGN.md](DESCRIPTOR_SET_LAYOUT_DESIGN.md) - Design decisions and patterns
+- [DESCRIPTOR_SET_LAYOUT_API.md](DESCRIPTOR_SET_LAYOUT_API.md) - API design comparison
+
 ## License
 
 Copyright © 2026 Crinklywrappr
