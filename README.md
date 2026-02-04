@@ -290,6 +290,19 @@ Descriptor set layouts define the shape of descriptor sets - which bindings exis
 - [DESCRIPTOR_SET_LAYOUT_DESIGN.md](DESCRIPTOR_SET_LAYOUT_DESIGN.md) - Design decisions and patterns
 - [DESCRIPTOR_SET_LAYOUT_API.md](DESCRIPTOR_SET_LAYOUT_API.md) - API design comparison
 
+
+### Test Portability
+
+Many tests currently have hardcoded assertions that only work on the development machine's specific GPU.
+
+**Goals:**
+- Use CLI tools (e.g., `vulkaninfo`) to gather system capabilities at test time
+- Generate assertions dynamically based on actual hardware
+- Tests pass on any Vulkan-capable machine by adapting to available features
+- Skip tests gracefully when required features are unavailable
+
+**Current Status:** Not yet implemented. Tests may fail on machines with different GPU capabilities.
+
 ## License
 
 Copyright © 2026 Crinklywrappr

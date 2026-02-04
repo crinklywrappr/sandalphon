@@ -5,6 +5,7 @@
             [clojure.reflect :as reflect]
             [camel-snake-kebab.core :as csk]
             [taoensso.trove :as log]
+            [crinklywrappr.sandalphon.error :refer [check-result error-message]]
             [crinklywrappr.sandalphon.protocols :refer [IVulkanHandle PropertyQueryable Indexable
                                                         handle properties index]])
   (:import [org.lwjgl.system MemoryStack MemoryUtil]
@@ -26,38 +27,6 @@
            [java.util.concurrent.atomic AtomicLong]))
 
 ;; TODO: all of the defs that use reflection could be wrapped in `(delay ...)`
-
-;; ============================================================================
-;; Error Handling
-;; ============================================================================
-
-(def ^:private vk-error-messages
-  "Maps Vulkan error codes to human-readable messages."
-  {VK10/VK_ERROR_OUT_OF_HOST_MEMORY "Out of host memory"
-   VK10/VK_ERROR_OUT_OF_DEVICE_MEMORY "Out of device memory"
-   VK10/VK_ERROR_INITIALIZATION_FAILED "Initialization failed"
-   VK10/VK_ERROR_DEVICE_LOST "Device lost"
-   VK10/VK_ERROR_MEMORY_MAP_FAILED "Memory map failed"
-   VK10/VK_ERROR_LAYER_NOT_PRESENT "Layer not present"
-   VK10/VK_ERROR_EXTENSION_NOT_PRESENT "Extension not present"
-   VK10/VK_ERROR_FEATURE_NOT_PRESENT "Feature not present"
-   VK10/VK_ERROR_INCOMPATIBLE_DRIVER "Cannot find a compatible Vulkan installable client driver (ICD)"
-   VK10/VK_ERROR_TOO_MANY_OBJECTS "Too many objects"
-   VK10/VK_ERROR_FORMAT_NOT_SUPPORTED "Format not supported"
-   VK10/VK_ERROR_FRAGMENTED_POOL "Fragmented pool"})
-
-(defn- error-message
-  "Returns a human-readable error message for a Vulkan result code."
-  [result]
-  (get vk-error-messages result (str "Unknown Vulkan error (code: " result ")")))
-
-(defn- check-result
-  "Checks a Vulkan result code and throws on error."
-  [result]
-  (when-not (= result VK10/VK_SUCCESS)
-    (throw (ex-info (error-message result) {:result result})))
-  result)
-
 ;; ============================================================================
 ;; Version Information - Step 1
 ;; ============================================================================
@@ -2891,108 +2860,3 @@
             (if on-error
               (on-error e)
               (throw e))))))))
-
-;; ============================================================================
-;; Descriptor Set Layouts
-;; ============================================================================
-
-(def ^:private descriptor-type->int
-  "Map of descriptor type keywords to VK10 integer constants.
-   Discovered via reflection at load time."
-  (delay
-    (into {}
-          (comp
-           (map (comp str :name))
-           (filter #(sg/starts-with? % "VK_DESCRIPTOR_TYPE_"))
-           (keep (fn [s]
-                   (when-let [v (.get (.getField VK10 s) nil)]
-                     [(-> (sg/replace s "VK_DESCRIPTOR_TYPE_" "")
-                          csk/->kebab-case-keyword)
-                      v]))))
-          (:members (reflect/type-reflect VK10)))))
-
-(def ^:private int->descriptor-type
-  "Reverse mapping: VK10 integer constants to descriptor type keywords."
-  (delay (st/map-invert @descriptor-type->int)))
-
-(def ^:private stage->int
-  "Map of shader stage keywords to VK10 bit constants.
-   Discovered via reflection at load time."
-  (delay
-    (into {}
-          (comp
-           (map (comp str :name))
-           (filter #(sg/starts-with? % "VK_SHADER_STAGE_"))
-           (filter #(sg/ends-with? % "_BIT"))
-           (keep (fn [s]
-                   (when-let [v (.get (.getField VK10 s) nil)]
-                     [(-> (sg/replace s "VK_SHADER_STAGE_" "")
-                          (sg/replace "_BIT" "")
-                          csk/->kebab-case-keyword)
-                      v]))))
-          (:members (reflect/type-reflect VK10)))))
-
-(def ^:private int->stage
-  "Reverse mapping: VK10 bit constants to shader stage keywords."
-  (delay (st/map-invert @stage->int)))
-
-(defn descriptor-types
-  "Returns the set of supported descriptor type keywords.
-
-   Example types:
-     :uniform-buffer          - Small read-only data (matrices, parameters)
-     :storage-buffer          - Large or read-write data
-     :uniform-buffer-dynamic  - Uniform buffer with runtime offset
-     :storage-buffer-dynamic  - Storage buffer with runtime offset
-     :sampled-image           - Textures for sampling
-     :storage-image           - Images for compute read/write
-     :sampler                 - Separate sampler object
-     :combined-image-sampler  - Texture + sampler together
-     :input-attachment        - Framebuffer input for subpasses"
-  []
-  (set (keys @descriptor-type->int)))
-
-(defn shader-stages
-  "Returns the set of supported shader stage keywords.
-
-   Example stages:
-     :vertex                   - Vertex shader
-     :fragment                 - Fragment shader
-     :compute                  - Compute shader
-     :geometry                 - Geometry shader
-     :tessellation-control     - Tessellation control shader
-     :tessellation-evaluation  - Tessellation evaluation shader"
-  []
-  (set (keys @stage->int)))
-
-(def ^:private binding-flag->int
-  "Map of descriptor binding flag keywords to VK12 bit constants.
-   Discovered via reflection at load time."
-  (delay
-    (into {}
-          (comp
-           (map (comp str :name))
-           (filter #(sg/starts-with? % "VK_DESCRIPTOR_BINDING_"))
-           (filter #(sg/ends-with? % "_BIT"))
-           (keep (fn [s]
-                   (when-let [v (.get (.getField VK12 s) nil)]
-                     [(-> (sg/replace s "VK_DESCRIPTOR_BINDING_" "")
-                          (sg/replace "_BIT" "")
-                          csk/->kebab-case-keyword)
-                      v]))))
-          (:members (reflect/type-reflect VK12)))))
-
-(def ^:private int->binding-flag
-  "Reverse mapping: VK12 bit constants to descriptor binding flag keywords."
-  (delay (st/map-invert @binding-flag->int)))
-
-(defn binding-flags
-  "Returns the set of supported descriptor binding flag keywords.
-
-   Flags:
-     :update-after-bind             - Descriptors can be updated after binding to command buffer
-     :partially-bound               - Not all array elements need valid descriptors
-     :update-unused-while-pending   - Can update descriptors not used by pending commands
-     :variable-descriptor-count     - Final binding has runtime-determined array size"
-  []
-  (set (keys @binding-flag->int)))
