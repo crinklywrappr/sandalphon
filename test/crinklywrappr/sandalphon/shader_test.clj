@@ -1,4 +1,4 @@
-(ns crinklywrappr.sandalphon-shader-test
+(ns crinklywrappr.sandalphon.shader-test
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.java.io :as io]
             [clojure.string :as sg]

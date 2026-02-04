@@ -1,4 +1,4 @@
-(ns crinklywrappr.sandalphon-descriptor-set-layout-test
+(ns crinklywrappr.sandalphon.descriptor-set-layout-test
   (:require [clojure.test :refer [deftest testing is are]]
             [crinklywrappr.sandalphon.descriptor-set-layout :as dsl]
             [crinklywrappr.sandalphon.core :as vk]

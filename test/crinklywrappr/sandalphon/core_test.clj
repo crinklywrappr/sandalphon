@@ -1,4 +1,4 @@
-(ns crinklywrappr.sandalphon-test
+(ns crinklywrappr.sandalphon.core-test
   (:require [clojure.test :refer [deftest is testing]]
             [crinklywrappr.sandalphon.core :as vk]
             [crinklywrappr.sandalphon.protocols :refer [handle properties index]]))
