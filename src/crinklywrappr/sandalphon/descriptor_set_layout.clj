@@ -19,106 +19,17 @@
     (def camera (binding 0 :uniform-buffer #{:vertex :fragment}))
     (def textures (binding 1 :sampled-image #{:fragment} :count 4))
     (build! device {:bindings [camera textures]})"
-  (:require [clojure.set :as st]
-            [clojure.string :as sg]
-            [clojure.reflect :as reflect]
-            [camel-snake-kebab.core :as csk]
+  (:require [crinklywrappr.sandalphon.constants :as const]
             [crinklywrappr.sandalphon.error :refer [check-result]]
             [crinklywrappr.sandalphon.protocols :refer [IVulkanHandle handle]])
   (:import [org.lwjgl.system MemoryStack]
-           [org.lwjgl.vulkan VK10 VK12
+           [org.lwjgl.vulkan VK10
             VkDescriptorSetLayoutBinding
             VkDescriptorSetLayoutCreateInfo]
            [java.io Closeable]))
 
 ;; ============================================================================
-;; Constants (discovered via reflection)
-;; ============================================================================
-
-(def ^:private descriptor-type->int
-  "Map of descriptor type keywords to VK10 integer constants.
-   Discovered via reflection at load time."
-  (delay
-    (into {}
-          (comp
-           (map (comp str :name))
-           (filter #(sg/starts-with? % "VK_DESCRIPTOR_TYPE_"))
-           (keep (fn [s]
-                   (when-let [v (.get (.getField VK10 s) nil)]
-                     [(-> (sg/replace s "VK_DESCRIPTOR_TYPE_" "")
-                          csk/->kebab-case-keyword)
-                      v]))))
-          (:members (reflect/type-reflect VK10)))))
-
-(def ^:private int->descriptor-type
-  "Reverse mapping: VK10 integer constants to descriptor type keywords."
-  (delay (st/map-invert @descriptor-type->int)))
-
-(def ^:private stage->int
-  "Map of shader stage keywords to VK10 bit constants.
-   Discovered via reflection at load time."
-  (delay
-    (into {}
-          (comp
-           (map (comp str :name))
-           (filter #(sg/starts-with? % "VK_SHADER_STAGE_"))
-           (filter #(sg/ends-with? % "_BIT"))
-           (keep (fn [s]
-                   (when-let [v (.get (.getField VK10 s) nil)]
-                     [(-> (sg/replace s "VK_SHADER_STAGE_" "")
-                          (sg/replace "_BIT" "")
-                          csk/->kebab-case-keyword)
-                      v]))))
-          (:members (reflect/type-reflect VK10)))))
-
-(def ^:private int->stage
-  "Reverse mapping: VK10 bit constants to shader stage keywords."
-  (delay (st/map-invert @stage->int)))
-
-(def ^:private binding-flag->int
-  "Map of descriptor binding flag keywords to VK12 bit constants.
-   Discovered via reflection at load time."
-  (delay
-    (into {}
-          (comp
-           (map (comp str :name))
-           (filter #(sg/starts-with? % "VK_DESCRIPTOR_BINDING_"))
-           (filter #(sg/ends-with? % "_BIT"))
-           (keep (fn [s]
-                   (when-let [v (.get (.getField VK12 s) nil)]
-                     [(-> (sg/replace s "VK_DESCRIPTOR_BINDING_" "")
-                          (sg/replace "_BIT" "")
-                          csk/->kebab-case-keyword)
-                      v]))))
-          (:members (reflect/type-reflect VK12)))))
-
-(def ^:private int->binding-flag
-  "Reverse mapping: VK12 bit constants to descriptor binding flag keywords."
-  (delay (st/map-invert @binding-flag->int)))
-
-(def ^:private layout-flag->int
-  "Map of layout create flag keywords to VK12 bit constants.
-   Discovered via reflection at load time."
-  (delay
-    (into {}
-          (comp
-           (map (comp str :name))
-           (filter #(sg/starts-with? % "VK_DESCRIPTOR_SET_LAYOUT_CREATE_"))
-           (filter #(sg/ends-with? % "_BIT"))
-           (keep (fn [s]
-                   (when-let [v (.get (.getField VK12 s) nil)]
-                     [(-> (sg/replace s "VK_DESCRIPTOR_SET_LAYOUT_CREATE_" "")
-                          (sg/replace "_BIT" "")
-                          csk/->kebab-case-keyword)
-                      v]))))
-          (:members (reflect/type-reflect VK12)))))
-
-(def ^:private int->layout-flag
-  "Reverse mapping: Vulkan bit constants to layout create flag keywords."
-  (delay (st/map-invert @layout-flag->int)))
-
-;; ============================================================================
-;; Public Query Functions
+;; Query Functions
 ;; ============================================================================
 
 (defn descriptor-types
@@ -135,7 +46,7 @@
      :combined-image-sampler  - Texture + sampler together
      :input-attachment        - Framebuffer input for subpasses"
   []
-  (set (keys @descriptor-type->int)))
+  (set (keys @const/descriptor-types)))
 
 (defn shader-stages
   "Returns the set of supported shader stage keywords.
@@ -148,7 +59,7 @@
      :tessellation-control     - Tessellation control shader
      :tessellation-evaluation  - Tessellation evaluation shader"
   []
-  (set (keys @stage->int)))
+  (set (keys @const/shader-stages)))
 
 (defn binding-flags
   "Returns the set of supported descriptor binding flag keywords.
@@ -159,7 +70,7 @@
      :update-unused-while-pending   - Can update descriptors not used by pending commands
      :variable-descriptor-count     - Final binding has runtime-determined array size"
   []
-  (set (keys @binding-flag->int)))
+  (set (keys @const/binding-flags)))
 
 (defn layout-flags
   "Returns the set of supported descriptor set layout create flag keywords.
@@ -167,7 +78,7 @@
    Flags:
      :update-after-bind-pool  - Descriptor sets from this layout can use update-after-bind"
   []
-  (set (keys @layout-flag->int)))
+  (set (keys @const/layout-flags)))
 
 ;; ============================================================================
 ;; Validation Helpers
@@ -180,7 +91,7 @@
   n)
 
 (defn- validate-descriptor-type [t]
-  (when-not (contains? (descriptor-types) t)
+  (when-not (contains? @const/descriptor-types t)
     (throw (ex-info "Invalid descriptor type"
                     {:type t
                      :valid-types (descriptor-types)})))
@@ -217,9 +128,18 @@
                          :valid-flags valid})))))
   flags)
 
-;; ============================================================================
-;; Builder Functions
-;; ============================================================================
+(defn- validate-layout-flags
+  "Validates layout-level flags."
+  [flag-set]
+  (when flag-set
+    (when-not (set? flag-set)
+      (throw (ex-info "Layout flags must be a set" {:flags flag-set})))
+    (let [valid (layout-flags)
+          invalid (remove valid flag-set)]
+      (when (seq invalid)
+        (throw (ex-info "Invalid layout flags"
+                        {:invalid-flags (set invalid)
+                         :valid-flags valid}))))))
 
 (defn- validate-binding-map
   "Validates a binding map from data literal style."
@@ -236,18 +156,9 @@
   (validate-count count)
   (validate-binding-flags flags))
 
-(defn- validate-layout-flags
-  "Validates layout-level flags."
-  [flag-set]
-  (when flag-set
-    (when-not (set? flag-set)
-      (throw (ex-info "Layout flags must be a set" {:flags flag-set})))
-    (let [valid (layout-flags)
-          invalid (remove valid flag-set)]
-      (when (seq invalid)
-        (throw (ex-info "Invalid layout flags"
-                        {:invalid-flags (set invalid)
-                         :valid-flags valid}))))))
+;; ============================================================================
+;; Builder Functions
+;; ============================================================================
 
 (defn layout
   "Creates an empty descriptor set layout builder map.
@@ -330,18 +241,6 @@
 ;; Layout Creation
 ;; ============================================================================
 
-(defn- stages->int
-  "Converts a set of stage keywords to a combined integer using bit-or."
-  [stages]
-  (transduce (map @stage->int) (completing bit-or) 0 stages))
-
-(defn- layout-flags->int
-  "Converts a set of layout flag keywords to a combined integer using bit-or."
-  [flags]
-  (if (empty? flags)
-    0
-    (transduce (map @layout-flag->int) (completing bit-or) 0 flags)))
-
 (defrecord DescriptorSetLayout [layout-map]
   IVulkanHandle
   (handle [this] (:handle (meta this)))
@@ -379,15 +278,15 @@
               (let [binding-struct (.get binding-buffer idx)]
                 (-> binding-struct
                     (.binding (:binding b))
-                    (.descriptorType (get @descriptor-type->int (:type b)))
+                    (.descriptorType (get @const/descriptor-types (:type b)))
                     (.descriptorCount (or (:count b) 1))
-                    (.stageFlags (stages->int (:stages b))))))
+                    (.stageFlags (const/stages->int (:stages b))))))
 
           ;; Create layout info
           layout-info (-> (VkDescriptorSetLayoutCreateInfo/calloc stack)
                           (.sType VK10/VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO)
                           (.pBindings binding-buffer)
-                          (.flags (layout-flags->int (or (:flags layout-map) #{}))))
+                          (.flags (const/layout-flags->int (or (:flags layout-map) #{}))))
 
           ;; Output pointer
           layout-ptr (.mallocLong stack 1)]

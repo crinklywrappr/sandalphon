@@ -313,3 +313,19 @@ _Feel free to remove or change the `LICENSE` file and remove or update this_
 _section of the `README.md` file!_
 
 Distributed under the Eclipse Public License version 1.0.
+
+### Pipeline Layout Flags
+
+Pipeline layouts currently don't support create flags. The only flag available is an extension flag:
+
+**Flag:**
+- `VK_PIPELINE_LAYOUT_CREATE_INDEPENDENT_SETS_BIT_EXT` - Allows pipeline libraries to use only a subset of descriptor set layouts
+
+**Requires:**
+- `VK_EXT_graphics_pipeline_library` extension
+
+**Use Case:**
+- Modular pipeline compilation where graphics pipelines are built in parts (vertex input, pre-rasterization, fragment shader, fragment output)
+- Useful for reducing pipeline compilation stutter in large applications
+
+**Current Status:** Not implemented. Core Vulkan has no pipeline layout flags, so this is low priority until graphics pipeline library support is added.
