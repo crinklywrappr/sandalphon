@@ -37,16 +37,16 @@
     (is (contains? (dsl/shader-stages) :tessellation-control))
     (is (contains? (dsl/shader-stages) :tessellation-evaluation))))
 
-(deftest binding-flags-test
+(deftest descriptor-flags-test
   (testing "returns a set of keywords"
-    (is (set? (dsl/binding-flags)))
-    (is (every? keyword? (dsl/binding-flags))))
+    (is (set? (dsl/descriptor-flags)))
+    (is (every? keyword? (dsl/descriptor-flags))))
 
   (testing "contains expected flags"
-    (is (contains? (dsl/binding-flags) :update-after-bind))
-    (is (contains? (dsl/binding-flags) :partially-bound))
-    (is (contains? (dsl/binding-flags) :update-unused-while-pending))
-    (is (contains? (dsl/binding-flags) :variable-descriptor-count))))
+    (is (contains? (dsl/descriptor-flags) :update-after-bind))
+    (is (contains? (dsl/descriptor-flags) :partially-bound))
+    (is (contains? (dsl/descriptor-flags) :update-unused-while-pending))
+    (is (contains? (dsl/descriptor-flags) :variable-descriptor-count))))
 
 (deftest layout-flags-test
   (testing "returns a set of keywords"
@@ -56,7 +56,7 @@
   (testing "contains expected flags"
     (is (contains? (dsl/layout-flags) :update-after-bind-pool)))
 
-  (testing "does not contain push-descriptor (not yet implemented)"
+  (testing "does not contain push-descriptor (roadmap item)"
     (is (not (contains? (dsl/layout-flags) :push-descriptor)))))
 
 ;; ============================================================================
@@ -65,147 +65,196 @@
 
 (deftest layout-0-arity-test
   (testing "returns empty layout map"
-    (is (= {:bindings []} (dsl/layout)))))
+    (is (= {:descriptors {}} (dsl/layout)))))
 
 (deftest layout-1-arity-test
   (testing "validates and returns valid layout"
-    (let [valid {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex}}]}]
-      (is (= valid (dsl/layout valid)))))
+    (let [m {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}}}]
+      (is (= m (dsl/layout m)))))
 
-  (testing "accepts empty bindings"
-    (is (= {:bindings []} (dsl/layout {:bindings []}))))
-
-  (testing "accepts layout with flags"
-    (let [with-flags {:bindings [] :flags #{:update-after-bind-pool}}]
-      (is (= with-flags (dsl/layout with-flags)))))
+  (testing "validates with flags"
+    (let [m {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}}
+             :flags #{:update-after-bind-pool}}]
+      (is (= m (dsl/layout m)))))
 
   (testing "throws on non-map"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Layout must be a map"
-          (dsl/layout "not a map"))))
+                          (dsl/layout "not a map"))))
 
   (testing "throws on missing bindings"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a vector"
-          (dsl/layout {}))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a map"
+                          (dsl/layout {}))))
 
-  (testing "throws on non-vector bindings"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a vector"
-          (dsl/layout {:bindings '()}))))
-
-  (testing "throws on invalid binding - missing :binding"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing :binding"
-          (dsl/layout {:bindings [{:type :uniform-buffer :stages #{:vertex}}]}))))
+  (testing "throws on non-map bindings"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a map"
+                          (dsl/layout {:descriptors []}))))
 
   (testing "throws on invalid binding - missing :type"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing :type"
-          (dsl/layout {:bindings [{:binding 0 :stages #{:vertex}}]}))))
+                          (dsl/layout {:descriptors {0 {:stages #{:vertex}}}}))))
 
   (testing "throws on invalid binding - missing :stages"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing :stages"
-          (dsl/layout {:bindings [{:binding 0 :type :uniform-buffer}]}))))
+                          (dsl/layout {:descriptors {0 {:type :uniform-buffer}}}))))
 
   (testing "throws on invalid descriptor type"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid descriptor type"
-          (dsl/layout {:bindings [{:binding 0 :type :invalid :stages #{:vertex}}]}))))
+                          (dsl/layout {:descriptors {0 {:type :invalid :stages #{:vertex}}}}))))
 
   (testing "throws on invalid stage"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid shader stages"
-          (dsl/layout {:bindings [{:binding 0 :type :uniform-buffer :stages #{:invalid}}]}))))
+                          (dsl/layout {:descriptors {0 {:type :uniform-buffer :stages #{:invalid}}}}))))
 
   (testing "throws on invalid layout flags"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid layout flags"
-          (dsl/layout {:bindings [] :flags #{:invalid-flag}})))))
+                          (dsl/layout {:descriptors {} :flags #{:invalid-flag}}))))
+
+  (testing "throws on variable-descriptor-count not on last binding"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"last binding"
+                          (dsl/layout {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}
+                                                        :flags #{:variable-descriptor-count}}
+                                                     1 {:type :uniform-buffer :stages #{:vertex}}}}))))
+
+  (testing "allows variable-descriptor-count on last binding"
+    (let [m {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}
+                           1 {:type :sampled-image :stages #{:fragment}
+                              :flags #{:variable-descriptor-count}}}}]
+      (is (= m (dsl/layout m)))))
+
+  (testing "allows variable-descriptor-count on only binding"
+    (let [m {:descriptors {0 {:type :sampled-image :stages #{:fragment}
+                              :flags #{:variable-descriptor-count}}}}]
+      (is (= m (dsl/layout m)))))
+
+  (testing "throws on update-after-bind without update-after-bind-pool layout flag"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"update-after-bind-pool layout flag"
+                          (dsl/layout {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}
+                                                        :flags #{:update-after-bind}}}}))))
+
+  (testing "allows update-after-bind with update-after-bind-pool layout flag"
+    (let [m {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}
+                              :flags #{:update-after-bind}}}
+             :flags #{:update-after-bind-pool}}]
+      (is (= m (dsl/layout m))))))
 
 ;; ============================================================================
 ;; Binding Function
 ;; ============================================================================
 
 (deftest binding-without-layout-test
-  (testing "3-arity creates binding map"
-    (let [b (dsl/binding 0 :uniform-buffer #{:vertex})]
-      (is (= 0 (:binding b)))
+  (testing "returns [binding-num binding-map] tuple"
+    (let [[n b] (dsl/descriptor 0 :uniform-buffer #{:vertex})]
+      (is (= 0 n))
       (is (= :uniform-buffer (:type b)))
       (is (= #{:vertex} (:stages b)))
       (is (= 1 (:count b)))))
 
   (testing "with :count option"
-    (let [b (dsl/binding 0 :sampled-image #{:fragment} :count 4)]
+    (let [[_ b] (dsl/descriptor 0 :sampled-image #{:fragment} :count 4)]
       (is (= 4 (:count b)))))
 
   (testing "with :flags option"
-    (let [b (dsl/binding 0 :sampled-image #{:fragment} :flags #{:partially-bound})]
+    (let [[_ b] (dsl/descriptor 0 :sampled-image #{:fragment} :flags #{:partially-bound})]
       (is (= #{:partially-bound} (:flags b)))))
 
-  (testing "with :binding-name option"
-    (let [b (dsl/binding 0 :uniform-buffer #{:vertex} :binding-name "camera")]
-      (is (= "camera" (:binding-name b)))))
+  (testing "with :name option"
+    (let [[_ b] (dsl/descriptor 0 :uniform-buffer #{:vertex} :name "camera")]
+      (is (= "camera" (:name b)))))
 
   (testing "with multiple options"
-    (let [b (dsl/binding 0 :sampled-image #{:fragment}
-                         :count 4
-                         :flags #{:partially-bound}
-                         :binding-name "textures")]
+    (let [[n b] (dsl/descriptor 0 :sampled-image #{:fragment}
+                                :count 4
+                                :flags #{:partially-bound}
+                                :name "textures")]
+      (is (= 0 n))
       (is (= 4 (:count b)))
       (is (= #{:partially-bound} (:flags b)))
-      (is (= "textures" (:binding-name b)))))
+      (is (= "textures" (:name b)))))
 
   (testing "with multiple stages"
-    (let [b (dsl/binding 0 :uniform-buffer #{:vertex :fragment})]
+    (let [[_ b] (dsl/descriptor 0 :uniform-buffer #{:vertex :fragment})]
       (is (= #{:vertex :fragment} (:stages b))))))
 
 (deftest binding-with-layout-test
-  (testing "4-arity adds binding to layout"
-    (let [l (dsl/binding (dsl/layout) 0 :uniform-buffer #{:vertex})]
-      (is (= 1 (count (:bindings l))))
-      (is (= 0 (get-in l [:bindings 0 :binding])))))
+  (testing "adds descriptor to layout"
+    (let [l (dsl/descriptor (dsl/layout) 0 :uniform-buffer #{:vertex})]
+      (is (map? l))
+      (is (contains? (:descriptors l) 0))
+      (is (= :uniform-buffer (get-in l [:descriptors 0 :type])))))
 
-  (testing "with options adds binding to layout"
-    (let [l (dsl/binding (dsl/layout) 0 :sampled-image #{:fragment} :count 4)]
-      (is (= 4 (get-in l [:bindings 0 :count])))))
-
-  (testing "chaining multiple bindings"
+  (testing "chaining multiple descriptors"
     (let [l (-> (dsl/layout)
-                (dsl/binding 0 :uniform-buffer #{:vertex :fragment})
-                (dsl/binding 1 :uniform-buffer #{:vertex :fragment})
-                (dsl/binding 2 :sampled-image #{:fragment} :count 4))]
-      (is (= 3 (count (:bindings l))))
-      (is (= [0 1 2] (mapv :binding (:bindings l)))))))
+                (dsl/descriptor 0 :uniform-buffer #{:vertex})
+                (dsl/descriptor 1 :sampled-image #{:fragment})
+                (dsl/descriptor 2 :storage-buffer #{:compute}))]
+      (is (= 3 (count (:descriptors l))))
+      (is (= #{0 1 2} (set (keys (:descriptors l)))))))
+
+  (testing "auto-adds update-after-bind-pool layout flag when descriptor uses update-after-bind"
+    (let [l (dsl/descriptor (dsl/layout) 0 :uniform-buffer #{:vertex} :flags #{:update-after-bind})]
+      (is (contains? (:flags l) :update-after-bind-pool))))
+
+  (testing "preserves existing layout flags when auto-adding update-after-bind-pool"
+    (let [l (-> (dsl/layout)
+                (dsl/flags #{:update-after-bind-pool})
+                (dsl/descriptor 0 :uniform-buffer #{:vertex} :flags #{:update-after-bind}))]
+      (is (= #{:update-after-bind-pool} (:flags l)))))
+
+  (testing "auto-added layout passes validation"
+    (let [l (-> (dsl/layout)
+                (dsl/descriptor 0 :uniform-buffer #{:vertex} :flags #{:update-after-bind}))]
+      (is (= l (dsl/layout l))))))
 
 (deftest binding-validation-test
   (testing "throws on negative binding number"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-negative integer"
-          (dsl/binding -1 :uniform-buffer #{:vertex}))))
+                          (dsl/descriptor -1 :uniform-buffer #{:vertex}))))
 
   (testing "throws on non-integer binding number"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-negative integer"
-          (dsl/binding "0" :uniform-buffer #{:vertex}))))
+                          (dsl/descriptor "0" :uniform-buffer #{:vertex}))))
 
   (testing "throws on invalid descriptor type"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid descriptor type"
-          (dsl/binding 0 :invalid-type #{:vertex}))))
+                          (dsl/descriptor 0 :invalid-type #{:vertex}))))
 
   (testing "throws on empty stages"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-empty set"
-          (dsl/binding 0 :uniform-buffer #{}))))
+                          (dsl/descriptor 0 :uniform-buffer #{}))))
 
   (testing "throws on non-set stages"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-empty set"
-          (dsl/binding 0 :uniform-buffer [:vertex]))))
+                          (dsl/descriptor 0 :uniform-buffer [:vertex]))))
 
   (testing "throws on invalid stage"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid shader stages"
-          (dsl/binding 0 :uniform-buffer #{:invalid-stage}))))
+                          (dsl/descriptor 0 :uniform-buffer #{:invalid-stage}))))
 
   (testing "throws on zero count"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
-          (dsl/binding 0 :uniform-buffer #{:vertex} :count 0))))
+                          (dsl/descriptor 0 :uniform-buffer #{:vertex} :count 0))))
 
   (testing "throws on negative count"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
-          (dsl/binding 0 :uniform-buffer #{:vertex} :count -1))))
+                          (dsl/descriptor 0 :uniform-buffer #{:vertex} :count -1))))
 
-  (testing "throws on invalid binding flags"
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid binding flags"
-          (dsl/binding 0 :uniform-buffer #{:vertex} :flags #{:invalid-flag})))))
+  (testing "throws on invalid descriptor flags"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid descriptor flags"
+                          (dsl/descriptor 0 :uniform-buffer #{:vertex} :flags #{:invalid-flag}))))
+
+  (testing "throws on variable-descriptor-count with dynamic buffer types"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Variable descriptor count cannot be used with dynamic buffer types"
+                          (dsl/descriptor 0 :uniform-buffer-dynamic #{:vertex} :flags #{:variable-descriptor-count})))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Variable descriptor count cannot be used with dynamic buffer types"
+                          (dsl/descriptor 0 :storage-buffer-dynamic #{:vertex} :flags #{:variable-descriptor-count}))))
+
+  (testing "allows variable-descriptor-count with non-dynamic types"
+    (let [[idx desc] (dsl/descriptor 0 :uniform-buffer #{:vertex} :flags #{:variable-descriptor-count})]
+      (is (= 0 idx))
+      (is (= #{:variable-descriptor-count} (:flags desc))))
+    (let [[idx desc] (dsl/descriptor 0 :storage-buffer #{:vertex} :flags #{:variable-descriptor-count})]
+      (is (= 0 idx))
+      (is (= #{:variable-descriptor-count} (:flags desc))))))
 
 ;; ============================================================================
 ;; Flags Function
@@ -218,18 +267,18 @@
 
   (testing "works in pipeline"
     (let [l (-> (dsl/layout)
-                (dsl/binding 0 :uniform-buffer #{:vertex})
+                (dsl/descriptor 0 :uniform-buffer #{:vertex})
                 (dsl/flags #{:update-after-bind-pool}))]
       (is (= #{:update-after-bind-pool} (:flags l)))
-      (is (= 1 (count (:bindings l))))))
+      (is (= 1 (count (:descriptors l))))))
 
   (testing "throws on non-set flags"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a set"
-          (dsl/flags (dsl/layout) :update-after-bind-pool))))
+                          (dsl/flags (dsl/layout) :update-after-bind-pool))))
 
   (testing "throws on invalid flag"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid layout flags"
-          (dsl/flags (dsl/layout) #{:invalid-flag})))))
+                          (dsl/flags (dsl/layout) #{:invalid-flag})))))
 
 ;; ============================================================================
 ;; Hybrid Style
@@ -237,12 +286,12 @@
 
 (deftest hybrid-style-test
   (testing "bindings can be defined separately and combined"
-    (let [camera (dsl/binding 0 :uniform-buffer #{:vertex :fragment})
-          lights (dsl/binding 1 :uniform-buffer #{:vertex :fragment})
-          textures (dsl/binding 2 :sampled-image #{:fragment} :count 4)
-          layout-map {:bindings [camera lights textures]}]
-      (is (= 3 (count (:bindings (dsl/layout layout-map)))))
-      (is (= [0 1 2] (mapv :binding (:bindings layout-map)))))))
+    (let [camera (dsl/descriptor 0 :uniform-buffer #{:vertex :fragment})
+          lights (dsl/descriptor 1 :uniform-buffer #{:vertex :fragment})
+          textures (dsl/descriptor 2 :sampled-image #{:fragment} :count 4)
+          layout-map {:descriptors (into {} [camera lights textures])}]
+      (is (= 3 (count (:descriptors (dsl/layout layout-map)))))
+      (is (= #{0 1 2} (set (keys (:descriptors layout-map))))))))
 
 ;; ============================================================================
 ;; All Descriptor Types
@@ -251,9 +300,15 @@
 (deftest all-descriptor-types-test
   (testing "all descriptor types can be used in bindings"
     (doseq [dtype (dsl/descriptor-types)]
-      (let [b (dsl/binding 0 dtype #{:compute})]
-        (is (= dtype (:type b))
-            (str "Descriptor type " dtype " should work"))))))
+      (let [[n b] (dsl/descriptor 0 dtype #{:compute})]
+        (is (= 0 n) (str "Binding number should be 0 for " dtype))
+        (is (= dtype (:type b)) (str "Type should be " dtype)))))
+
+  (testing "all descriptor types can be used in layout validation"
+    (doseq [[idx dtype] (map-indexed vector (dsl/descriptor-types))]
+      (let [layout-map {:descriptors {idx {:type dtype :stages #{:compute}}}}]
+        (is (= layout-map (dsl/layout layout-map))
+            (str "Descriptor type " dtype " should validate"))))))
 
 ;; ============================================================================
 ;; All Shader Stages
@@ -262,29 +317,29 @@
 (deftest all-shader-stages-test
   (testing "all shader stages can be used in bindings"
     (doseq [stage (dsl/shader-stages)]
-      (let [b (dsl/binding 0 :uniform-buffer #{stage})]
+      (let [[_ b] (dsl/descriptor 0 :uniform-buffer #{stage})]
         (is (contains? (:stages b) stage)
             (str "Shader stage " stage " should work")))))
 
   (testing "all stages can be combined"
     (let [all-stages (dsl/shader-stages)
-          b (dsl/binding 0 :uniform-buffer all-stages)]
+          [_ b] (dsl/descriptor 0 :uniform-buffer all-stages)]
       (is (= all-stages (:stages b))))))
 
 ;; ============================================================================
 ;; All Binding Flags
 ;; ============================================================================
 
-(deftest all-binding-flags-test
+(deftest all-descriptor-flags-test
   (testing "all binding flags can be used"
-    (doseq [flag (dsl/binding-flags)]
-      (let [b (dsl/binding 0 :uniform-buffer #{:compute} :flags #{flag})]
+    (doseq [flag (dsl/descriptor-flags)]
+      (let [[_ b] (dsl/descriptor 0 :uniform-buffer #{:vertex} :flags #{flag})]
         (is (contains? (:flags b) flag)
             (str "Binding flag " flag " should work")))))
 
-  (testing "all binding flags can be combined"
-    (let [all-flags (dsl/binding-flags)
-          b (dsl/binding 0 :uniform-buffer #{:compute} :flags all-flags)]
+  (testing "all flags can be combined"
+    (let [all-flags (dsl/descriptor-flags)
+          [_ b] (dsl/descriptor 0 :uniform-buffer #{:vertex} :flags all-flags)]
       (is (= all-flags (:flags b))))))
 
 ;; ============================================================================
@@ -309,32 +364,31 @@
 
 (deftest complex-layout-test
   (testing "complex multi-binding layout validates"
-    (let [layout-map {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex :fragment} :count 1}
-                                 {:binding 1 :type :uniform-buffer :stages #{:vertex :fragment} :count 1}
-                                 {:binding 2 :type :sampled-image :stages #{:fragment} :count 4
-                                  :flags #{:partially-bound}}
-                                 {:binding 3 :type :storage-buffer :stages #{:compute} :count 1}
-                                 {:binding 4 :type :storage-image :stages #{:compute} :count 1}]
+    (let [layout-map {:descriptors {0 {:type :uniform-buffer :stages #{:vertex :fragment} :count 1}
+                                    1 {:type :uniform-buffer :stages #{:vertex :fragment} :count 1}
+                                    2 {:type :sampled-image :stages #{:fragment} :count 4
+                                       :flags #{:partially-bound}}
+                                    3 {:type :storage-buffer :stages #{:compute} :count 1}
+                                    4 {:type :storage-image :stages #{:compute} :count 1}}
                       :flags #{:update-after-bind-pool}}]
       (is (= layout-map (dsl/layout layout-map)))))
 
   (testing "complex layout via builder"
     (let [l (-> (dsl/layout)
-                (dsl/binding 0 :uniform-buffer #{:vertex :fragment} :binding-name "camera")
-                (dsl/binding 1 :uniform-buffer #{:vertex :fragment} :binding-name "lights")
-                (dsl/binding 2 :sampled-image #{:fragment} :count 4 :flags #{:partially-bound} :binding-name "textures")
-                (dsl/binding 3 :storage-buffer #{:compute} :binding-name "input")
-                (dsl/binding 4 :storage-image #{:compute} :binding-name "output")
+                (dsl/descriptor 0 :uniform-buffer #{:vertex :fragment} :name "camera")
+                (dsl/descriptor 1 :uniform-buffer #{:vertex :fragment} :name "lights")
+                (dsl/descriptor 2 :sampled-image #{:fragment} :count 4 :flags #{:partially-bound} :name "textures")
+                (dsl/descriptor 3 :storage-buffer #{:compute} :name "input")
+                (dsl/descriptor 4 :storage-image #{:compute} :name "output")
                 (dsl/flags #{:update-after-bind-pool}))]
-      (is (= 5 (count (:bindings l))))
+      (is (= 5 (count (:descriptors l))))
       (is (= #{:update-after-bind-pool} (:flags l)))
-      (is (= ["camera" "lights" "textures" "input" "output"]
-             (mapv :binding-name (:bindings l)))))))
+      (is (= #{"camera" "lights" "textures" "input" "output"}
+             (set (map :name (vals (:descriptors l)))))))))
 
 ;; ============================================================================
 ;; build! Function Tests (requires Vulkan device)
 ;; ============================================================================
-
 
 (deftest build!-basic-test
   (testing "build! creates a DescriptorSetLayout with valid handle"
@@ -346,9 +400,8 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [layout (dsl/build! device
-                                 {:bindings [{:binding 0
-                                              :type :uniform-buffer
-                                              :stages #{:vertex :fragment}}]})]
+                                           {:descriptors {0 {:type :uniform-buffer
+                                                             :stages #{:vertex :fragment}}}})]
               (is (some? layout))
               (is (instance? crinklywrappr.sandalphon.descriptor_set_layout.DescriptorSetLayout layout))
               (is (instance? java.io.Closeable layout))
@@ -364,7 +417,7 @@
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (with-open [layout (dsl/build! device {:bindings []})]
+            (with-open [layout (dsl/build! device {:descriptors {}})]
               (is (some? (handle layout))))))))))
 
 (deftest build!-multiple-bindings-test
@@ -377,12 +430,12 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [layout (dsl/build! device
-                                 {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex}}
-                                             {:binding 1 :type :uniform-buffer :stages #{:fragment}}
-                                             {:binding 2 :type :sampled-image :stages #{:fragment}}
-                                             {:binding 3 :type :storage-buffer :stages #{:compute}}]})]
+                                           {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}
+                                                          1 {:type :uniform-buffer :stages #{:fragment}}
+                                                          2 {:type :sampled-image :stages #{:fragment}}
+                                                          3 {:type :storage-buffer :stages #{:compute}}}})]
               (is (some? (handle layout)))
-              (is (= 4 (count (get-in layout [:layout-map :bindings])))))))))))
+              (is (= 4 (count (get-in layout [:layout-map :descriptors])))))))))))
 
 (deftest build!-with-array-count-test
   (testing "build! works with descriptor arrays"
@@ -394,12 +447,11 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [layout (dsl/build! device
-                                 {:bindings [{:binding 0
-                                              :type :sampled-image
-                                              :stages #{:fragment}
-                                              :count 16}]})]
+                                           {:descriptors {0 {:type :sampled-image
+                                                             :stages #{:fragment}
+                                                             :count 16}}})]
               (is (some? (handle layout)))
-              (is (= 16 (get-in layout [:layout-map :bindings 0 :count]))))))))))
+              (is (= 16 (get-in layout [:layout-map :descriptors 0 :count]))))))))))
 
 (deftest build!-all-descriptor-types-test
   (testing "build! works with all descriptor types"
@@ -412,9 +464,8 @@
                               :queue-requests [(first queue-families)])]
             (doseq [[idx dtype] (map-indexed vector (dsl/descriptor-types))]
               (with-open [layout (dsl/build! device
-                                   {:bindings [{:binding idx
-                                                :type dtype
-                                                :stages #{:compute}}]})]
+                                             {:descriptors {idx {:type dtype
+                                                                 :stages #{:compute}}}})]
                 (is (some? (handle layout))
                     (str "Descriptor type " dtype " should create valid layout"))))))))))
 
@@ -430,17 +481,15 @@
             ;; Test each stage individually
             (doseq [stage (dsl/shader-stages)]
               (with-open [layout (dsl/build! device
-                                   {:bindings [{:binding 0
-                                                :type :uniform-buffer
-                                                :stages #{stage}}]})]
+                                             {:descriptors {0 {:type :uniform-buffer
+                                                               :stages #{stage}}}})]
                 (is (some? (handle layout))
                     (str "Shader stage " stage " should create valid layout"))))
 
             ;; Test all stages combined
             (with-open [layout (dsl/build! device
-                                 {:bindings [{:binding 0
-                                              :type :uniform-buffer
-                                              :stages (dsl/shader-stages)}]})]
+                                           {:descriptors {0 {:type :uniform-buffer
+                                                             :stages (dsl/shader-stages)}}})]
               (is (some? (handle layout))
                   "All shader stages combined should create valid layout"))))))))
 
@@ -454,12 +503,11 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (let [layout-map (-> (dsl/layout)
-                                 (dsl/binding 0 :uniform-buffer #{:vertex :fragment})
-                                 (dsl/binding 1 :uniform-buffer #{:vertex :fragment})
-                                 (dsl/binding 2 :sampled-image #{:fragment} :count 4))]
+                                 (dsl/descriptor 0 :uniform-buffer #{:vertex :fragment})
+                                 (dsl/descriptor 1 :sampled-image #{:fragment} :count 4))]
               (with-open [layout (dsl/build! device layout-map)]
                 (is (some? (handle layout)))
-                (is (= 3 (count (get-in layout [:layout-map :bindings]))))))))))))
+                (is (= 2 (count (get-in layout [:layout-map :descriptors]))))))))))))
 
 (deftest build!-hybrid-style-test
   (testing "build! works with hybrid-style layout"
@@ -470,11 +518,12 @@
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (let [camera (dsl/binding 0 :uniform-buffer #{:vertex :fragment})
-                  lights (dsl/binding 1 :uniform-buffer #{:fragment})
-                  textures (dsl/binding 2 :sampled-image #{:fragment} :count 4)]
-              (with-open [layout (dsl/build! device {:bindings [camera lights textures]})]
-                (is (some? (handle layout)))))))))))
+            (let [camera (dsl/descriptor 0 :uniform-buffer #{:vertex :fragment})
+                  textures (dsl/descriptor 1 :sampled-image #{:fragment} :count 4)
+                  layout-map {:descriptors (into {} [camera textures])}]
+              (with-open [layout (dsl/build! device layout-map)]
+                (is (some? (handle layout)))
+                (is (= 2 (count (get-in layout [:layout-map :descriptors]))))))))))))
 
 (deftest build!-preserves-layout-map-test
   (testing "build! preserves the original layout-map in the record"
@@ -485,14 +534,9 @@
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (let [original-map {:bindings [{:binding 0
-                                            :type :uniform-buffer
-                                            :stages #{:vertex}
-                                            :count 1}
-                                           {:binding 1
-                                            :type :storage-buffer
-                                            :stages #{:compute}
-                                            :count 1}]}]
+            (let [original-map {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}
+                                              1 {:type :sampled-image :stages #{:fragment} :count 4}}
+                                :flags #{:update-after-bind-pool}}]
               (with-open [layout (dsl/build! device original-map)]
                 (is (= original-map (:layout-map layout)))))))))))
 
@@ -505,32 +549,28 @@
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (with-open [layout (dsl/build! device {:bindings []})]
+            (with-open [layout (dsl/build! device {:descriptors {}})]
               (is (some? (:device (meta layout))))
               (is (= device (:device (meta layout)))))))))))
 
 (deftest build!-multiple-layouts-test
-  (testing "Can create multiple layouts from same device"
-    (with-open [instance (vk/instance! :app-name "DSL Multiple Layouts Test")]
+  (testing "Can create multiple descriptor set layouts from same device"
+    (with-open [instance (vk/instance! :app-name "DSL Multiple Test")]
       (let [physical-device (first (vk/physical-devices instance))
             queue-families (vk/queue-families physical-device)]
         (when (seq queue-families)
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (with-open [layout1 (dsl/build! device
-                                  {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex}}]})
-                        layout2 (dsl/build! device
-                                  {:bindings [{:binding 0 :type :storage-buffer :stages #{:compute}}]})
-                        layout3 (dsl/build! device
-                                  {:bindings [{:binding 0 :type :sampled-image :stages #{:fragment}}]})]
+            (with-open [layout1 (dsl/build! device {:descriptors {}})
+                        layout2 (dsl/build! device {:descriptors {}})
+                        layout3 (dsl/build! device {:descriptors {}})]
               (is (some? (handle layout1)))
               (is (some? (handle layout2)))
               (is (some? (handle layout3)))
               ;; Each layout should have a unique handle
               (is (not= (handle layout1) (handle layout2)))
-              (is (not= (handle layout2) (handle layout3)))
-              (is (not= (handle layout1) (handle layout3))))))))))
+              (is (not= (handle layout2) (handle layout3))))))))))
 
 (deftest build!-close-test
   (testing "Closing layout destroys the Vulkan object"
@@ -541,11 +581,10 @@
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (let [layout (dsl/build! device {:bindings []})]
+            (let [layout (dsl/build! device {:descriptors {}})]
               (is (some? (handle layout)))
               (.close layout)
-              ;; After close, the layout should still have the handle in metadata
-              ;; but using it would be unsafe (this tests close doesn't throw)
+              ;; After close, handle still in metadata but using it would be unsafe
               (is (some? (:handle (meta layout)))))))))))
 
 (deftest build!-validation-test
@@ -558,24 +597,19 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
 
+            (testing "Rejects non-map layout"
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Layout must be a map"
+                                    (dsl/build! device "not a map"))))
+
             (testing "Rejects invalid descriptor type"
               (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid descriptor type"
-                    (dsl/build! device
-                      {:bindings [{:binding 0 :type :invalid :stages #{:vertex}}]}))))
+                                    (dsl/build! device
+                                                {:descriptors {0 {:type :invalid :stages #{:vertex}}}}))))
 
             (testing "Rejects invalid stage"
               (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Invalid shader stages"
-                    (dsl/build! device
-                      {:bindings [{:binding 0 :type :uniform-buffer :stages #{:invalid}}]}))))
-
-            (testing "Rejects missing binding"
-              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"missing :binding"
-                    (dsl/build! device
-                      {:bindings [{:type :uniform-buffer :stages #{:vertex}}]}))))
-
-            (testing "Rejects non-vector bindings"
-              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a vector"
-                    (dsl/build! device {:bindings '()}))))))))))
+                                    (dsl/build! device
+                                                {:descriptors {0 {:type :uniform-buffer :stages #{:invalid}}}}))))))))))
 
 (deftest build!-sparse-bindings-test
   (testing "build! works with non-contiguous binding numbers"
@@ -587,43 +621,8 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [layout (dsl/build! device
-                                 {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex}}
-                                             {:binding 5 :type :uniform-buffer :stages #{:fragment}}
-                                             {:binding 10 :type :sampled-image :stages #{:fragment}}]})]
-              (is (some? (handle layout))))))))))
-
-(deftest build!-complex-layout-test
-  (testing "build! works with complex real-world layout"
-    (with-open [instance (vk/instance! :app-name "DSL Complex Test")]
-      (let [physical-device (first (vk/physical-devices instance))
-            queue-families (vk/queue-families physical-device)]
-        (when (seq queue-families)
-          (with-open [device (vk/logical-device!
-                              :physical-device physical-device
-                              :queue-requests [(first queue-families)])]
-            ;; Simulate a typical PBR material layout
-            (let [layout-map (-> (dsl/layout)
-                                 ;; Camera/scene uniforms
-                                 (dsl/binding 0 :uniform-buffer #{:vertex :fragment}
-                                              :binding-name "camera")
-                                 ;; Model transforms
-                                 (dsl/binding 1 :uniform-buffer #{:vertex}
-                                              :binding-name "model")
-                                 ;; Material parameters
-                                 (dsl/binding 2 :uniform-buffer #{:fragment}
-                                              :binding-name "material")
-                                 ;; Albedo texture
-                                 (dsl/binding 3 :combined-image-sampler #{:fragment}
-                                              :binding-name "albedo")
-                                 ;; Normal map
-                                 (dsl/binding 4 :combined-image-sampler #{:fragment}
-                                              :binding-name "normal")
-                                 ;; Metallic-roughness map
-                                 (dsl/binding 5 :combined-image-sampler #{:fragment}
-                                              :binding-name "metallicRoughness")
-                                 ;; Environment map (cubemap array)
-                                 (dsl/binding 6 :combined-image-sampler #{:fragment}
-                                              :count 6 :binding-name "envMap"))]
-              (with-open [layout (dsl/build! device layout-map)]
-                (is (some? (handle layout)))
-                (is (= 7 (count (get-in layout [:layout-map :bindings]))))))))))))
+                                           {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}
+                                                          5 {:type :uniform-buffer :stages #{:fragment}}
+                                                          10 {:type :sampled-image :stages #{:fragment}}}})]
+              (is (some? (handle layout)))
+              (is (= 3 (count (get-in layout [:layout-map :descriptors])))))))))))

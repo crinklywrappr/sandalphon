@@ -146,7 +146,7 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [dsl-layout (dsl/build! device
-                                     {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex}}]})]
+                                     {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}}})]
               (with-open [layout (pl/build! device
                                    {:set-layouts {0 dsl-layout}
                                     :push-constants []})]
@@ -162,9 +162,9 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [scene-dsl (dsl/build! device
-                                    {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex :fragment}}]})
+                                    {:descriptors {0 {:type :uniform-buffer :stages #{:vertex :fragment}}}})
                         material-dsl (dsl/build! device
-                                       {:bindings [{:binding 0 :type :sampled-image :stages #{:fragment}}]})]
+                                       {:descriptors {0 {:type :sampled-image :stages #{:fragment}}}})]
               (with-open [layout (pl/build! device
                                    {:set-layouts {0 scene-dsl, 1 material-dsl}
                                     :push-constants []})]
@@ -181,7 +181,7 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [scene-dsl (dsl/build! device
-                                    {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex}}]})]
+                                    {:descriptors {0 {:type :uniform-buffer :stages #{:vertex}}}})]
               (let [layout-map (-> (pl/layout)
                                    (pl/descriptor-set-layout 0 scene-dsl)
                                    (pl/push-constants 0 64 #{:vertex}))]
@@ -198,11 +198,11 @@
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
             (with-open [scene-dsl (dsl/build! device
-                                    {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex :fragment}}
-                                                {:binding 1 :type :uniform-buffer :stages #{:fragment}}]})
+                                    {:descriptors {0 {:type :uniform-buffer :stages #{:vertex :fragment}}
+                                                1 {:type :uniform-buffer :stages #{:fragment}}}})
                         material-dsl (dsl/build! device
-                                       {:bindings [{:binding 0 :type :combined-image-sampler :stages #{:fragment}}
-                                                   {:binding 1 :type :combined-image-sampler :stages #{:fragment}}]})]
+                                       {:descriptors {0 {:type :combined-image-sampler :stages #{:fragment}}
+                                                   1 {:type :combined-image-sampler :stages #{:fragment}}}})]
               (with-open [layout (pl/build! device
                                    {:set-layouts {0 scene-dsl, 1 material-dsl}
                                     :push-constants [{:offset 0 :size 64 :stages #{:vertex}}
@@ -220,7 +220,7 @@
           (with-open [device (vk/logical-device!
                               :physical-device physical-device
                               :queue-requests [(first queue-families)])]
-            (with-open [dsl-layout (dsl/build! device {:bindings []})]
+            (with-open [dsl-layout (dsl/build! device {:descriptors {}})]
               (let [original-map {:set-layouts {0 dsl-layout}
                                   :push-constants [{:offset 0 :size 64 :stages #{:vertex}}]}]
                 (with-open [layout (pl/build! device original-map)]

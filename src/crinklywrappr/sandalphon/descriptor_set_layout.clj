@@ -5,20 +5,20 @@
 
   Builder style (threading macro):
     (-> (layout)
-        (binding 0 :uniform-buffer #{:vertex :fragment})
-        (binding 1 :sampled-image #{:fragment} :count 4)
+        (descriptor 0 :uniform-buffer #{:vertex :fragment})
+        (descriptor 1 :sampled-image #{:fragment} :count 4)
         (flags #{:update-after-bind-pool})
         (build! device))
 
   Data literal style:
     (build! device
-      {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex :fragment}}
-                  {:binding 1 :type :sampled-image :stages #{:fragment} :count 4}]})
+      {:descriptors {0 {:type :uniform-buffer :stages #{:vertex :fragment}}
+                  1 {:type :sampled-image :stages #{:fragment} :count 4}}})
 
   Hybrid style (build bindings separately):
-    (def camera (binding 0 :uniform-buffer #{:vertex :fragment}))
-    (def textures (binding 1 :sampled-image #{:fragment} :count 4))
-    (build! device {:bindings [camera textures]})"
+    (def camera (descriptor 0 :uniform-buffer #{:vertex :fragment}))
+    (def textures (descriptor 1 :sampled-image #{:fragment} :count 4))
+    (build! device {:descriptors (into {} (map-indexed vector [camera textures]))})"
   (:require [crinklywrappr.sandalphon.constants :as const]
             [crinklywrappr.sandalphon.error :refer [check-result]]
             [crinklywrappr.sandalphon.protocols :refer [IVulkanHandle handle]])
@@ -61,7 +61,7 @@
   []
   (set (keys @const/shader-stages)))
 
-(defn binding-flags
+(defn descriptor-flags
   "Returns the set of supported descriptor binding flag keywords.
 
    Flags:
@@ -84,7 +84,7 @@
 ;; Validation Helpers
 ;; ============================================================================
 
-(defn- validate-binding-number [n]
+(defn- validate-descriptor-index [n]
   (when-not (and (integer? n) (>= n 0))
     (throw (ex-info "Binding number must be a non-negative integer"
                     {:binding n})))
@@ -109,24 +109,29 @@
                        :valid-stages valid}))))
   stages)
 
-(defn- validate-count [c]
+(defn- validate-descriptor-count [c]
   (when-not (and (integer? c) (pos? c))
     (throw (ex-info "Count must be a positive integer"
                     {:count c})))
   c)
 
-(defn- validate-binding-flags [flags]
-  (when flags
-    (when-not (set? flags)
-      (throw (ex-info "Binding flags must be a set"
-                      {:flags flags})))
-    (let [valid (binding-flags)
-          invalid (remove valid flags)]
+(defn- validate-descriptor-flags [desc-flags desc-type]
+  (when desc-flags
+    (when-not (set? desc-flags)
+      (throw (ex-info "Descriptor flags must be a set"
+                      {:flags desc-flags})))
+    (let [valid (descriptor-flags)
+          invalid (remove valid desc-flags)]
       (when (seq invalid)
-        (throw (ex-info "Invalid binding flags"
+        (throw (ex-info "Invalid descriptor flags"
                         {:invalid-flags (set invalid)
-                         :valid-flags valid})))))
-  flags)
+                         :valid-flags valid}))))
+    ;; Type-specific restrictions
+    (when (and (contains? desc-flags :variable-descriptor-count)
+               (contains? #{:uniform-buffer-dynamic :storage-buffer-dynamic} desc-type))
+      (throw (ex-info "Variable descriptor count cannot be used with dynamic buffer types"
+                      {:flags desc-flags :type desc-type}))))
+  desc-flags)
 
 (defn- validate-layout-flags
   "Validates layout-level flags."
@@ -141,20 +146,18 @@
                         {:invalid-flags (set invalid)
                          :valid-flags valid}))))))
 
-(defn- validate-binding-map
+(defn- validate-descriptor-map
   "Validates a binding map from data literal style."
-  [{:keys [binding type stages count flags] :or {count 1} :as m}]
-  (when-not (contains? m :binding)
-    (throw (ex-info "Binding map missing :binding" {:binding-map m})))
+  [descriptor-idx {:keys [type stages count flags] :or {count 1} :as m}]
+  (validate-descriptor-index descriptor-idx)
   (when-not (contains? m :type)
-    (throw (ex-info "Binding map missing :type" {:binding-map m})))
+    (throw (ex-info "Descriptor map missing :type" {:descriptor descriptor-idx :descriptor-map m})))
   (when-not (contains? m :stages)
-    (throw (ex-info "Binding map missing :stages" {:binding-map m})))
-  (validate-binding-number binding)
+    (throw (ex-info "Descriptor map missing :stages" {:descriptor descriptor-idx :descriptor-map m})))
   (validate-descriptor-type type)
   (validate-stages stages)
-  (validate-count count)
-  (validate-binding-flags flags))
+  (validate-descriptor-count count)
+  (validate-descriptor-flags flags type))
 
 ;; ============================================================================
 ;; Builder Functions
@@ -164,62 +167,99 @@
   "Creates an empty descriptor set layout builder map.
 
   With no arguments, returns a new empty layout:
-    (layout) ;; => {:bindings []}
+    (layout) ;; => {:descriptors {}}
 
   With an existing map, validates and returns it:
-    (layout {:bindings [...]}) ;; validates and returns"
+    (layout {:descriptors {...}}) ;; validates and returns"
   ([]
-   {:bindings []})
+   {:descriptors {}})
   ([m]
    (when-not (map? m)
      (throw (ex-info "Layout must be a map" {:got (type m)})))
-   (when-not (vector? (:bindings m))
-     (throw (ex-info "Layout :bindings must be a vector"
-                     {:bindings (:bindings m)})))
-   (doseq [b (:bindings m)]
-     (validate-binding-map b))
+   (when-not (map? (:descriptors m))
+     (throw (ex-info "Layout :descriptors must be a map"
+                     {:descriptors (:descriptors m)})))
+   (doseq [[descriptor-idx b] (:descriptors m)]
+     (validate-descriptor-map descriptor-idx b))
    (validate-layout-flags (:flags m))
+
+   ;; Validate variable-descriptor-count is only on the last binding
+   (let [descriptors-with-variable-count
+         (filter (fn [[_ desc]] (contains? (:flags desc) :variable-descriptor-count))
+                 (:descriptors m))]
+     (when (seq descriptors-with-variable-count)
+       (let [max-idx (apply max (keys (:descriptors m)))
+             variable-indices (map first descriptors-with-variable-count)]
+         (when-not (= variable-indices [max-idx])
+           (throw (ex-info "Variable descriptor count flag can only be used on the last binding (highest index)"
+                           {:variable-descriptor-count-indices (vec variable-indices)
+                            :max-index max-idx}))))))
+
+   ;; Validate update-after-bind requires update-after-bind-pool layout flag
+   (let [has-update-after-bind?
+         (some (fn [[_ desc]] (contains? (:flags desc) :update-after-bind))
+               (:descriptors m))]
+     (when (and has-update-after-bind?
+                (not (contains? (:flags m) :update-after-bind-pool)))
+       (throw (ex-info "Descriptors with :update-after-bind flag require :update-after-bind-pool layout flag"
+                       {:layout-flags (:flags m)}))))
+
    m))
 
-(defn binding
-  "Creates a descriptor binding or adds one to an existing layout.
+(defn descriptor
+  "Creates a descriptor or adds one to an existing layout.
 
-  Without a layout (returns binding map):
-    (binding 0 :uniform-buffer #{:vertex :fragment})
-    (binding 1 :sampled-image #{:fragment} :count 4 :flags #{:partially-bound})
+  Without a layout (returns [index descriptor-map] entry):
+    (descriptor 0 :uniform-buffer #{:vertex :fragment})
+    ;; => [0 {:type :uniform-buffer :stages #{:vertex :fragment} :count 1}]
 
   With a layout (returns updated layout):
     (-> (layout)
-        (binding 0 :uniform-buffer #{:vertex :fragment})
-        (binding 1 :sampled-image #{:fragment}))
+        (descriptor 0 :uniform-buffer #{:vertex :fragment})
+        (descriptor 1 :sampled-image #{:fragment}))
 
   Options:
-    :count        - Number of descriptors (default 1, use for arrays)
-    :flags        - Set of per-binding flags (e.g., #{:partially-bound})
-    :samplers     - Vector of immutable sampler handles
-    :binding-name - Debug name (not sent to Vulkan, for documentation)"
-  {:arglists '([binding-num type stages & {:keys [count flags samplers binding-name]}]
-               [layout binding-num type stages & {:keys [count flags samplers binding-name]}])}
+    :count    - Number of descriptors (default 1, use for arrays)
+    :flags    - Set of per-descriptor flags (e.g., #{:partially-bound})
+    :samplers - Vector of immutable sampler handles
+    :name     - Debug name (not sent to Vulkan, for documentation)
+
+  Note: If :update-after-bind flag is used, :update-after-bind-pool will be
+  automatically added to the layout flags."
+  {:arglists '([index type stages & {:keys [count flags samplers name]}]
+               [layout index type stages & {:keys [count flags samplers name]}])}
   [& args]
-  (let [[layout? binding-num type stages & opts]
+  (let [[layout? idx desc-type desc-stages & opts]
         (if (map? (first args))
           args
           (cons nil args))
-        {:keys [count flags samplers binding-name]
-         :or {count 1}} (apply hash-map opts)
+        {desc-count :count
+         desc-flags :flags
+         desc-samplers :samplers
+         desc-name :name
+         :or {desc-count 1}} (apply hash-map opts)
 
-        ;; Validate & build binding map
-        binding-map (cond-> {:binding (validate-binding-number binding-num)
-                             :type (validate-descriptor-type type)
-                             :stages (validate-stages stages)
-                             :count (validate-count count)}
-                      flags (assoc :flags (validate-binding-flags flags))
-                      samplers (assoc :samplers samplers)
-                      binding-name (assoc :binding-name binding-name))]
+        ;; Validate
+        _ (validate-descriptor-index idx)
+        _ (validate-descriptor-type desc-type)
+        _ (validate-stages desc-stages)
+        _ (validate-descriptor-count desc-count)
+        _ (validate-descriptor-flags desc-flags desc-type)
+
+        ;; Build descriptor map
+        descriptor-map (cond-> {:type desc-type
+                                :stages desc-stages
+                                :count desc-count}
+                         desc-flags (assoc :flags desc-flags)
+                         desc-samplers (assoc :samplers desc-samplers)
+                         desc-name (assoc :name desc-name))]
 
     (if layout?
-      (update layout? :bindings conj binding-map)
-      binding-map)))
+      (cond-> (assoc-in layout? [:descriptors idx] descriptor-map)
+        ;; Auto-add :update-after-bind-pool if descriptor uses :update-after-bind
+        (contains? desc-flags :update-after-bind)
+        (update :flags (fnil conj #{}) :update-after-bind-pool))
+      [idx descriptor-map])))
 
 (defn flags
   "Sets layout-level create flags on a descriptor set layout.
@@ -229,7 +269,7 @@
 
   Example:
     (-> (layout)
-        (binding 0 :uniform-buffer #{:vertex})
+        (descriptor 0 :uniform-buffer #{:vertex})
         (flags #{:update-after-bind-pool}))"
   [layout flag-set]
   (when-not (set? flag-set)
@@ -260,7 +300,7 @@
 
   Example:
     (build! device
-      {:bindings [{:binding 0 :type :uniform-buffer :stages #{:vertex :fragment}}]})
+      {:descriptors {0 {:type :uniform-buffer :stages #{:vertex :fragment}}}})
 
   The returned layout can be closed with (.close layout) or used with with-open."
   [device layout-map]
@@ -269,15 +309,15 @@
 
   (with-open [^MemoryStack stack (MemoryStack/stackPush)]
     (let [device-handle (handle device)
-          bindings (:bindings layout-map)
-          binding-count (count bindings)
+          descriptors-map (:descriptors layout-map)
+          binding-count (count descriptors-map)
 
           ;; Create binding structs
           binding-buffer (VkDescriptorSetLayoutBinding/calloc binding-count stack)
-          _ (doseq [[idx b] (map-indexed vector bindings)]
+          _ (doseq [[idx [binding-num b]] (map-indexed vector descriptors-map)]
               (let [binding-struct (.get binding-buffer idx)]
                 (-> binding-struct
-                    (.binding (:binding b))
+                    (.binding binding-num)
                     (.descriptorType (get @const/descriptor-types (:type b)))
                     (.descriptorCount (or (:count b) 1))
                     (.stageFlags (const/stages->int (:stages b))))))
