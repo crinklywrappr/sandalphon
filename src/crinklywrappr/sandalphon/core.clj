@@ -10,7 +10,7 @@
                                                         handle properties index]])
   (:import [org.lwjgl.system MemoryStack MemoryUtil]
            [org.lwjgl.vulkan VK VkApplicationInfo VkInstanceCreateInfo VkInstance
-            VkPhysicalDevice VkPhysicalDeviceProperties VkPhysicalDeviceFeatures
+            VkPhysicalDevice VkPhysicalDeviceProperties VkPhysicalDeviceFeatures VkPhysicalDeviceLimits VkPhysicalDeviceSparseProperties
             VkLayerProperties VkExtensionProperties VkPhysicalDeviceGroupProperties
             VkQueueFamilyProperties VkDebugUtilsMessengerCallbackEXT VkCommandBuffer
             VkDebugUtilsMessengerCallbackDataEXT VkDebugUtilsMessengerCreateInfoEXT
@@ -501,7 +501,124 @@
          (for [i (range (.remaining byte-buffer))]
            (format "%02x" (bit-and 0xFF (.get byte-buffer i))))))
 
-;; TODO: limits and sparse-properties need to be improved
+(defn- int-buffer->vec
+  "Converts an IntBuffer to a Clojure vector."
+  [^java.nio.IntBuffer buf]
+  (vec (for [i (range (.remaining buf))] (.get buf i))))
+
+(defn- limits->map
+  "Converts VkPhysicalDeviceLimits to a Clojure map with kebab-case keywords."
+  [^VkPhysicalDeviceLimits limits]
+  {;; Descriptor limits
+   :max-bound-descriptor-sets (.maxBoundDescriptorSets limits)
+   :max-per-stage-descriptor-samplers (.maxPerStageDescriptorSamplers limits)
+   :max-per-stage-descriptor-uniform-buffers (.maxPerStageDescriptorUniformBuffers limits)
+   :max-per-stage-descriptor-storage-buffers (.maxPerStageDescriptorStorageBuffers limits)
+   :max-per-stage-descriptor-sampled-images (.maxPerStageDescriptorSampledImages limits)
+   :max-per-stage-descriptor-storage-images (.maxPerStageDescriptorStorageImages limits)
+   :max-per-stage-descriptor-input-attachments (.maxPerStageDescriptorInputAttachments limits)
+   :max-per-stage-resources (.maxPerStageResources limits)
+   :max-descriptor-set-samplers (.maxDescriptorSetSamplers limits)
+   :max-descriptor-set-uniform-buffers (.maxDescriptorSetUniformBuffers limits)
+   :max-descriptor-set-uniform-buffers-dynamic (.maxDescriptorSetUniformBuffersDynamic limits)
+   :max-descriptor-set-storage-buffers (.maxDescriptorSetStorageBuffers limits)
+   :max-descriptor-set-storage-buffers-dynamic (.maxDescriptorSetStorageBuffersDynamic limits)
+   :max-descriptor-set-sampled-images (.maxDescriptorSetSampledImages limits)
+   :max-descriptor-set-storage-images (.maxDescriptorSetStorageImages limits)
+   :max-descriptor-set-input-attachments (.maxDescriptorSetInputAttachments limits)
+   ;; Sampler limits
+   :max-sampler-allocation-count (.maxSamplerAllocationCount limits)
+   :max-sampler-lod-bias (.maxSamplerLodBias limits)
+   :max-sampler-anisotropy (.maxSamplerAnisotropy limits)
+   ;; Image limits
+   :max-image-dimension-1d (.maxImageDimension1D limits)
+   :max-image-dimension-2d (.maxImageDimension2D limits)
+   :max-image-dimension-3d (.maxImageDimension3D limits)
+   :max-image-dimension-cube (.maxImageDimensionCube limits)
+   :max-image-array-layers (.maxImageArrayLayers limits)
+   :max-texel-buffer-elements (.maxTexelBufferElements limits)
+   ;; Buffer limits
+   :max-uniform-buffer-range (.maxUniformBufferRange limits)
+   :max-storage-buffer-range (.maxStorageBufferRange limits)
+   :max-push-constants-size (.maxPushConstantsSize limits)
+   ;; Memory limits
+   :max-memory-allocation-count (.maxMemoryAllocationCount limits)
+   :min-memory-map-alignment (.minMemoryMapAlignment limits)
+   :min-texel-buffer-offset-alignment (.minTexelBufferOffsetAlignment limits)
+   :min-uniform-buffer-offset-alignment (.minUniformBufferOffsetAlignment limits)
+   :min-storage-buffer-offset-alignment (.minStorageBufferOffsetAlignment limits)
+   ;; Vertex limits
+   :max-vertex-input-attributes (.maxVertexInputAttributes limits)
+   :max-vertex-input-bindings (.maxVertexInputBindings limits)
+   :max-vertex-input-attribute-offset (.maxVertexInputAttributeOffset limits)
+   :max-vertex-input-binding-stride (.maxVertexInputBindingStride limits)
+   :max-vertex-output-components (.maxVertexOutputComponents limits)
+   ;; Fragment limits
+   :max-fragment-input-components (.maxFragmentInputComponents limits)
+   :max-fragment-output-attachments (.maxFragmentOutputAttachments limits)
+   :max-fragment-dual-src-attachments (.maxFragmentDualSrcAttachments limits)
+   :max-fragment-combined-output-resources (.maxFragmentCombinedOutputResources limits)
+   ;; Compute limits
+   :max-compute-shared-memory-size (.maxComputeSharedMemorySize limits)
+   :max-compute-work-group-count (int-buffer->vec (.maxComputeWorkGroupCount limits))
+   :max-compute-work-group-invocations (.maxComputeWorkGroupInvocations limits)
+   :max-compute-work-group-size (int-buffer->vec (.maxComputeWorkGroupSize limits))
+   ;; Geometry limits
+   :max-geometry-shader-invocations (.maxGeometryShaderInvocations limits)
+   :max-geometry-input-components (.maxGeometryInputComponents limits)
+   :max-geometry-output-components (.maxGeometryOutputComponents limits)
+   :max-geometry-output-vertices (.maxGeometryOutputVertices limits)
+   :max-geometry-total-output-components (.maxGeometryTotalOutputComponents limits)
+   ;; Tessellation limits
+   :max-tessellation-generation-level (.maxTessellationGenerationLevel limits)
+   :max-tessellation-patch-size (.maxTessellationPatchSize limits)
+   :max-tessellation-control-per-vertex-input-components (.maxTessellationControlPerVertexInputComponents limits)
+   :max-tessellation-control-per-vertex-output-components (.maxTessellationControlPerVertexOutputComponents limits)
+   :max-tessellation-control-per-patch-output-components (.maxTessellationControlPerPatchOutputComponents limits)
+   :max-tessellation-control-total-output-components (.maxTessellationControlTotalOutputComponents limits)
+   :max-tessellation-evaluation-input-components (.maxTessellationEvaluationInputComponents limits)
+   :max-tessellation-evaluation-output-components (.maxTessellationEvaluationOutputComponents limits)
+   ;; Viewport limits
+   :max-viewports (.maxViewports limits)
+   :max-viewport-dimensions (int-buffer->vec (.maxViewportDimensions limits))
+   ;; Framebuffer limits
+   :max-framebuffer-width (.maxFramebufferWidth limits)
+   :max-framebuffer-height (.maxFramebufferHeight limits)
+   :max-framebuffer-layers (.maxFramebufferLayers limits)
+   :max-color-attachments (.maxColorAttachments limits)
+   ;; Clipping limits
+   :max-clip-distances (.maxClipDistances limits)
+   :max-cull-distances (.maxCullDistances limits)
+   :max-combined-clip-and-cull-distances (.maxCombinedClipAndCullDistances limits)
+   ;; Draw limits
+   :max-draw-indexed-index-value (.maxDrawIndexedIndexValue limits)
+   :max-draw-indirect-count (.maxDrawIndirectCount limits)
+   ;; Texel limits
+   :min-texel-offset (.minTexelOffset limits)
+   :max-texel-offset (.maxTexelOffset limits)
+   :min-texel-gather-offset (.minTexelGatherOffset limits)
+   :max-texel-gather-offset (.maxTexelGatherOffset limits)
+   ;; Interpolation limits
+   :min-interpolation-offset (.minInterpolationOffset limits)
+   :max-interpolation-offset (.maxInterpolationOffset limits)
+   ;; Other limits
+   :max-sample-mask-words (.maxSampleMaskWords limits)
+   :timestamp-compute-and-graphics (.timestampComputeAndGraphics limits)
+   :strict-lines (.strictLines limits)
+   :standard-sample-locations (.standardSampleLocations limits)
+   :optimal-buffer-copy-offset-alignment (.optimalBufferCopyOffsetAlignment limits)
+   :optimal-buffer-copy-row-pitch-alignment (.optimalBufferCopyRowPitchAlignment limits)
+   :non-coherent-atom-size (.nonCoherentAtomSize limits)})
+
+(defn- sparse-properties->map
+  "Converts VkPhysicalDeviceSparseProperties to a Clojure map."
+  [^VkPhysicalDeviceSparseProperties sparse]
+  {:residency-standard-2d-block-shape (.residencyStandard2DBlockShape sparse)
+   :residency-standard-2d-multisample-block-shape (.residencyStandard2DMultisampleBlockShape sparse)
+   :residency-standard-3d-block-shape (.residencyStandard3DBlockShape sparse)
+   :residency-aligned-mip-size (.residencyAlignedMipSize sparse)
+   :residency-non-resident-strict (.residencyNonResidentStrict sparse)})
+
 (defn- query-device-properties
   "Queries all properties of a physical device."
   [^VkPhysicalDevice device ^MemoryStack stack]
@@ -514,8 +631,8 @@
      :vendor-id (.vendorID props)
      :device-id (.deviceID props)
      :pipeline-cache-uuid (bytes->hex (.pipelineCacheUUID props))
-     :limits (.limits props)
-     :sparse-properties (.sparseProperties props)}))
+     :limits (limits->map (.limits props))
+     :sparse-properties (sparse-properties->map (.sparseProperties props))}))
 
 (defn- query-device-extension-properties
   "Queries extension properties for a physical device.
